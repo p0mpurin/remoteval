@@ -884,6 +884,7 @@ import re
 import threading
 import time
 import uuid
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1024,6 +1025,137 @@ def _shipping_processes():
     return tuple(sorted(matches)) or None
 
 
+# White PLAY glyphs from the user's 1920x1080 reference, x=868,y=0,w=128,h=56.
+# Embedded binary mask, not an external image/dependency. Matching is conservative
+# and intentionally limited to this English red-banner layout.
+_PLAY_MASK = zlib.decompress(base64.b64decode(
+    "eNrt1tEKgCAMQNHt/386CCJ00zKdhtz7VkinskQRIiL6X3qXnvIG2RF27Hf/uk6zL6N8ffDTG1jt6z5+gjb43bz3JMa3v4jgn4eL"
+    + "/X6+0dfaPYX6+VzjD+HfrD/+vzbUr66/+PkMyZCtx9v9xyy/dOEJfvXUYt/5QvD397PloLgFmeMX3wt+sK+xPhEREUV0ABKHBDI="))
+_PLAY_POINTS = [(i % 128, i // 128) for i, pixel in enumerate(_PLAY_MASK) if pixel]
+
+
+def play_banner_score(bgra):
+    if len(bgra) != 128*56*4:
+        return 0.
+    white = bytearray(128*56)
+    red = 0
+    for i in range(128*56):
+        b, g, r = bgra[i*4:i*4+3]
+        white[i] = min(r, g, b) > 185
+        red += r > 130 and r > g*1.5 and r > b*1.3
+    if red < 128*56*.5:
+        return 0.
+    total = sum(white)
+    best = 0.
+    for dy in range(-3, 4):
+        for dx in range(-5, 6):
+            overlap = sum(white[(y+dy)*128+x+dx] for x,y in _PLAY_POINTS
+                          if 0 <= x+dx < 128 and 0 <= y+dy < 56)
+            best = max(best, 2.*overlap/(len(_PLAY_POINTS)+total))
+    return best
+
+
+def capture_play_banner(identity):
+    """Render the game HWND into a private bitmap; never sample desktop pixels."""
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    gdi = ctypes.WinDLL("gdi32", use_last_error=True)
+    user.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+    user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+    user.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user.IsIconic.argtypes = [wintypes.HWND]
+    user.GetDC.argtypes = [wintypes.HWND]
+    user.GetDC.restype = wintypes.HDC
+    user.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    gdi.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    gdi.CreateCompatibleDC.restype = wintypes.HDC
+    gdi.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+    gdi.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi.SelectObject.argtypes = [wintypes.HDC, wintypes.HANDLE]
+    gdi.SelectObject.restype = wintypes.HANDLE
+    gdi.DeleteObject.argtypes = [wintypes.HANDLE]
+    gdi.DeleteDC.argtypes = [wintypes.HDC]
+    gdi.SetStretchBltMode.argtypes = [wintypes.HDC, ctypes.c_int]
+    gdi.PatBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+    gdi.StretchBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                              wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("width", wintypes.LONG), ("height", wintypes.LONG),
+                    ("planes", wintypes.WORD), ("bits", wintypes.WORD), ("compression", wintypes.DWORD),
+                    ("image_size", wintypes.DWORD), ("xppm", wintypes.LONG), ("yppm", wintypes.LONG),
+                    ("colors", wintypes.DWORD), ("important", wintypes.DWORD)]
+    gdi.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT,
+                              ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT]
+    if not identity:
+        return None
+    handles = []
+    allowed = {p[0] for p in identity}
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    def inspect(hwnd, unused):
+        pid = wintypes.DWORD()
+        user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        name = ctypes.create_unicode_buffer(128)
+        user.GetClassNameW(hwnd, name, len(name))
+        if pid.value in allowed and name.value == "UnrealWindow" and not user.IsIconic(hwnd):
+            handles.append(hwnd)
+            return False
+        return True
+    user.EnumWindows(callback_type(inspect), 0)
+    if not handles:
+        return None
+    hwnd = handles[0]
+    rect = RECT()
+    if not user.GetClientRect(hwnd, ctypes.byref(rect)):
+        return None
+    width, height = rect.right, rect.bottom
+    if width < 640 or height < 360 or not 1.7 < width/height < 1.85:
+        return None
+    screen = user.GetDC(hwnd)  # compatibility only; its pixels are never copied
+    memory = gdi.CreateCompatibleDC(screen)
+    bitmap = gdi.CreateCompatibleBitmap(screen, 128, 56)
+    full_dc = gdi.CreateCompatibleDC(screen)
+    full_bitmap = gdi.CreateCompatibleBitmap(screen, width, height)
+    if not screen or not memory or not bitmap or not full_dc or not full_bitmap:
+        if full_bitmap: gdi.DeleteObject(full_bitmap)
+        if full_dc: gdi.DeleteDC(full_dc)
+        if bitmap: gdi.DeleteObject(bitmap)
+        if memory: gdi.DeleteDC(memory)
+        if screen: user.ReleaseDC(hwnd, screen)
+        return None
+    old = gdi.SelectObject(memory, bitmap)
+    full_old = gdi.SelectObject(full_dc, full_bitmap)
+    try:
+        gdi.PatBlt(full_dc, 0, 0, width, height, 0x00000042)  # clear to black
+        # PW_CLIENTONLY | PW_RENDERFULLCONTENT. Occluding windows are not drawn.
+        if not user.PrintWindow(hwnd, full_dc, 3):
+            return None
+        gdi.SetStretchBltMode(memory, 4)  # HALFTONE scaling for 720p/768p/1080p
+        ok = gdi.StretchBlt(memory, 0, 0, 128, 56, full_dc,
+                            round(width*868/1920), 0,
+                            round(width*128/1920), round(height*56/1080), 0x00CC0020)
+        gdi.SelectObject(memory, old)
+        old = None
+        if not ok:
+            return None
+        header = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), 128, -56, 1, 32, 0, 0, 0, 0, 0, 0)
+        buffer = ctypes.create_string_buffer(128*56*4)
+        if gdi.GetDIBits(memory, bitmap, 0, 56, buffer, ctypes.byref(header), 0) != 56:
+            return None
+        pixels = buffer.raw
+        if not any(pixels[i] for i in range(len(pixels)) if i % 4 != 3):
+            return None  # GPU backend did not provide content; no desktop fallback
+        return pixels
+    finally:
+        if old: gdi.SelectObject(memory, old)
+        gdi.SelectObject(full_dc, full_old)
+        gdi.DeleteObject(full_bitmap)
+        gdi.DeleteDC(full_dc)
+        gdi.DeleteObject(bitmap)
+        gdi.DeleteDC(memory)
+        user.ReleaseDC(hwnd, screen)
+
+
 
 def timestamp(value):
     """Accept timezone-qualified ISO 8601 only; never invent a queue start."""
@@ -1161,6 +1293,7 @@ class StateStore:
         pre = fresh.get("pregame", (0, None))[1]
         loop = presence.get("sessionLoopState")
         party = presence.get("partyState")
+        party_data = fresh.get("party", (0, {}))[1] or {}
         source = "none"
         candidate = None
         if core or loop == "INGAME":
@@ -1169,10 +1302,15 @@ class StateStore:
             candidate, source = "AGENT_SELECT", "pregame" if pre else "presence"
         elif loop == "MENUS" and party == "MATCHMADE_GAME_STARTING":
             candidate, source = "AGENT_SELECT", "presence_match_found"
-        elif loop == "MENUS" and party == "MATCHMAKING":
-            candidate, source = "QUEUED", "presence"
+        elif (loop == "MENUS" and party == "MATCHMAKING") or party_data.get("State") == "MATCHMAKING":
+            candidate, source = "QUEUED", "presence" if party == "MATCHMAKING" else "party"
         elif loop == "MENUS" and party == "DEFAULT" and (self.menu_samples >= 2 or self.presence_changed or now-self.lobby_verified_at <= .5):
             candidate, source = "MENUS", "presence"
+        elif (now-self.lobby_verified_at <= .5 and
+              all(k in fresh and fresh[k][1] is None for k in ("core", "pregame")) and
+              party not in ("MATCHMAKING", "MATCHMADE_GAME_STARTING") and
+              (self.state != "QUEUED" or party_data.get("State") == "DEFAULT")):
+            candidate, source = "MENUS", "visual"
 
         # A negative lookup is absence only for that API. Require both APIs to
         # be absent plus menus presence before clearing a latched match phase.
@@ -1242,6 +1380,7 @@ class StateStore:
                     "state_confirmed": self.state_confirmed,
                     "presence_loop": (self.sources.get("presence", (0, {}))[1] or {}).get("sessionLoopState"),
                     "presence_party": (self.sources.get("presence", (0, {}))[1] or {}).get("partyState"),
+                    "visual_detection": copy.deepcopy(self.sources.get("visual", (0, {}))[1]),
                     "queue_elapsed_secs": elapsed,
                     "queue_entry_time": self.queue_anchor[0] if self.queue_anchor else None,
                     "queue_clock": "clean_pc_wall_clock_anchored_to_monotonic",
@@ -1266,7 +1405,7 @@ class Detector:
         self.lockfile = Path(os.environ.get("LOCALAPPDATA", "")) / "Riot Games/Riot Client/Config/lockfile"
 
     def start(self):
-        for target in (self._process_loop, self._local_loop):
+        for target in (self._process_loop, self._local_loop, self._visual_loop):
             self._spawn(target)
         for kind in ("core", "pregame", "party"):
             self._spawn(lambda k=kind: self._remote_loop(k))
@@ -1291,6 +1430,41 @@ class Detector:
             except OSError:
                 self.store.error("process", "process_inspection_failed")
             self.stop_event.wait(.15)
+
+    def _visual_loop(self):
+        hits = 0
+        previous_generation = None
+        # Thread-local DPI awareness keeps client coordinates and pixels aligned.
+        try:
+            user = ctypes.WinDLL("user32")
+            user.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            user.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        except (AttributeError, OSError):
+            pass
+        while not self.stop_event.is_set():
+            began = time.monotonic()
+            with self.store.lock:
+                generation, identity = self.store.generation, self.store.identity
+            if generation != previous_generation:
+                hits = 0
+                previous_generation = generation
+            try:
+                pixels = capture_play_banner(identity)
+                score = play_banner_score(pixels) if pixels else 0.
+                hits = min(2, hits+1) if score >= .76 else 0
+                if hits >= 2:
+                    self.store.verify_lobby(generation)
+                elif identity:
+                    with self.store.lock:
+                        if generation == self.store.generation:
+                            self.store.lobby_verified_at = 0.
+                self.store.observe("visual", {"play_score": round(score, 3), "confirmed": hits >= 2,
+                                               "method": "PrintWindow",
+                                               "capture_available": pixels is not None}, generation, began)
+            except (OSError, ValueError, ctypes.ArgumentError):
+                hits = 0
+                self.store.error("visual", "screen_capture_failed")
+            self.stop_event.wait(max(.01, .2-(time.monotonic()-began)))
 
     @staticmethod
     def _session():
@@ -1413,7 +1587,9 @@ class Detector:
                                     self.remote_pause_until = max(self.remote_pause_until,
                                         time.monotonic()+self._retry_after(r.headers.get("Retry-After")))
                             r.raise_for_status()
-                            value = r.json().get("MatchmakingData") or {}
+                            party_response = r.json()
+                            value = dict(party_response.get("MatchmakingData") or {})
+                            value["State"] = party_response.get("State")
                     with self.auth_lock:
                         current_auth = self.auth
                     if current_auth is auth:

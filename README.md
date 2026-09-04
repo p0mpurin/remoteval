@@ -62,9 +62,27 @@ interval is 500 ms per remote worker, subject to RTT and backoff.
 presence samples, a detected game window, and fresh negative pregame and core-game
 lookups. Missing or expired evidence disables PLAY. Process/session changes reset
 the evidence. `readiness_basis=api` explicitly distinguishes this from visual proof;
-`lobby_visual_verified` stays false unless a separate verifier supplies it.
+`lobby_visual_verified` distinguishes the embedded visual fallback from API readiness.
 The GUI must honor `ready_to_play`, not enable PLAY from `menus` alone. A fresh but
 unconfirmed startup state is no longer incorrectly marked as stale.
+
+An embedded visual fallback now recognizes the white **PLAY** text on the red
+top-center banner from the supplied English main-menu screenshot. It uses native
+Windows GDI capture and a compressed glyph template inside `clean_agent.py`, with
+no OCR installation or image files needed at runtime. Two consecutive matches at
+200 ms intervals confirm the banner. The score is exposed as
+`visual_detection.play_score`. Capture uses the actual game's process-owned
+`UnrealWindow` HWND with `PrintWindow`, not desktop pixels, so another app covering
+the game is not included. `capture_available=false` means there is no suitable
+window, it is minimized, its aspect ratio is unsupported, or capture failed/was blank.
+
+The recognizer supports the supplied 16:9 layout, including 1366x768 and 1920x1080.
+Different languages, aspect ratios, UI layouts, or GPU/exclusive-fullscreen capture
+behavior may prevent a match. PrintWindow support depends on the rendering backend;
+if it supplies a blank frame, there is deliberately no desktop-capture fallback.
+With missing presence fields, it requires fresh negative pregame/core-game lookups
+before enabling PLAY. Positive queue/match evidence wins. Visual evidence expires
+after 500 ms and never turns a core-game transition into a claimed 5v5 screenshot.
 
 Stop the queue animation whenever phase is not `QUEUED`, status is `degraded`, or
 communication goes stale. Anchor numeric `queue_elapsed_secs` to the GUI's steady
