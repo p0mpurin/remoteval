@@ -627,28 +627,78 @@ def glz(verb, path, body=None):
     except Exception as e:
         return None, "glz error: %s" % e
 
+def local_api(path, method="GET", body=None):
+    """Call the local Riot Client API using the lockfile credentials."""
+    lf = read_lockfile()
+    if not lf:
+        return None, "lockfile not found"
+    port = lf["port"]
+    pw = lf["password"]
+    creds = base64.b64encode(("riot:" + pw).encode()).decode()
+    url = "https://127.0.0.1:%d%s" % (port, path)
+    headers = {
+        "Authorization": "Basic " + creds,
+        "Content-Type": "application/json",
+    }
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with _open(req, timeout=10) as r:
+            return json.loads(r.read().decode()), None
+    except Exception as e:
+        return None, "local_api error: %s" % e
+
+_cached_puuid = None
+
+def get_puuid():
+    """Get player PUUID from local Riot Client session API."""
+    global _cached_puuid
+    if _cached_puuid:
+        return _cached_puuid, None
+    data, err = local_api("/chat/v1/session")
+    if err or not data:
+        return None, err or "no session"
+    puuid = data.get("puuid") or data.get("game_puuid")
+    if not puuid:
+        return None, "no puuid in session: %s" % str(data)[:120]
+    _cached_puuid = puuid
+    return puuid, None
+
 def party_id():
-    data, err = glz("GET", "/parties/v1/parties")
-    if err:
-        return None, err
-    return data.get("ID") or data.get("id"), None
+    """Get the player's current party ID via the correct GLZ endpoint."""
+    puuid, err = get_puuid()
+    if err or not puuid:
+        return None, err or "no puuid"
+    data, err = glz("GET", "/parties/v1/players/%s" % puuid)
+    if err or not data:
+        return None, err or "no party data"
+    pid = data.get("CurrentPartyID") or data.get("PartyID") or data.get("ID") or data.get("id")
+    if not pid:
+        return None, "no party ID in response: %s" % str(data)[:120]
+    return pid, None
 
 def set_queue_mode(mode):
     pid, err = party_id()
     if err or not pid:
+        print("[QUEUE] party_id failed: %s" % err)
         return {"ok": False, "error": err or "no party"}
     data, err = glz("POST", "/parties/v1/parties/%s/queue" % pid, {"queueID": mode})
+    print("[QUEUE] set_queue_mode %s -> err=%s resp=%s" % (mode, err, str(data)[:120]))
     return {"ok": err is None, "party": pid, "queue": mode, "resp": data, "error": err}
 
 def start_queue(mode):
     pid, err = party_id()
     if err or not pid:
+        print("[QUEUE] party_id failed: %s" % err)
         return {"ok": False, "error": err or "no party"}
     # 1. Set the game mode / queue on the party
     data1, err1 = glz("POST", "/parties/v1/parties/%s/queue" % pid, {"queueID": mode})
+    print("[QUEUE] set queue %s -> err=%s resp=%s" % (mode, err1, str(data1)[:120]))
     # 2. Enter the matchmaking queue
     data2, err2 = glz("POST", "/parties/v1/parties/%s/matchmaking/join" % pid, {})
-    return {"ok": err2 is None, "party": pid, "queue": mode, "set_resp": data1, "join_resp": data2, "error": err2 or err1}
+    print("[QUEUE] matchmaking/join -> err=%s resp=%s" % (err2, str(data2)[:120]))
+    return {"ok": err2 is None, "party": pid, "queue": mode,
+            "set_resp": data1, "join_resp": data2, "error": err2 or err1}
 
 def cancel_queue():
     pid, err = party_id()
