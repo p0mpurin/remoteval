@@ -643,7 +643,11 @@ def local_api(path, method="GET", body=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with _open(req, timeout=10) as r:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=_CTX),
+            urllib.request.ProxyHandler({})
+        )
+        with opener.open(req, timeout=10) as r:
             return json.loads(r.read().decode()), None
     except Exception as e:
         return None, "local_api error: %s" % e
