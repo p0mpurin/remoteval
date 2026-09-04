@@ -280,6 +280,67 @@ def wait_lockfile(seconds):
         time.sleep(0.5)
     return None
 
+_launch_in_progress = False
+_last_launch_status = "idle"
+
+def get_launch_status():
+    global _last_launch_status
+    return _last_launch_status
+
+def set_launch_status(s):
+    global _last_launch_status
+    _last_launch_status = s
+    print("[LAUNCH] %s" % s)
+
+def find_valorant_launcher_exe():
+    """Locate official VALORANT.exe bootstrapper."""
+    yaml_path = r"C:\ProgramData\Riot Games\Metadata\valorant.live\valorant.live.product_settings.yaml"
+    if os.path.exists(yaml_path):
+        try:
+            with open(yaml_path, "r", errors="ignore") as f:
+                content = f.read()
+            m = re.search(r'product_install_full_path:\s*["\']?([^"\']+)["\']?', content)
+            if m:
+                cand = os.path.join(m.group(1).replace("/", "\\"), "VALORANT.exe")
+                if os.path.exists(cand):
+                    return cand
+        except Exception:
+            pass
+
+    for drive in ("C", "D", "E", "F"):
+        candidates = [
+            rf"{drive}:\Riot Games\VALORANT\live\VALORANT.exe",
+            rf"{drive}:\Program Files\Riot Games\VALORANT\live\VALORANT.exe",
+            rf"{drive}:\Games\Riot Games\VALORANT\live\VALORANT.exe",
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+    return None
+
+def focus_riot_client():
+    try:
+        def enum_cb(hwnd, results):
+            if ctypes.windll.user32.IsWindowVisible(hwnd):
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                    if "Riot Client" in buf.value:
+                        results.append(hwnd)
+            return True
+        results = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        ctypes.windll.user32.EnumWindows(WNDENUMPROC(enum_cb), ctypes.byref(results))
+        if results:
+            hwnd = results[0]
+            ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            return True
+    except Exception:
+        pass
+    return False
+
 def rc_trigger_launch(lf):
     """Trigger Valorant launch via Riot Client's internal Foundation API."""
     try:
@@ -287,74 +348,105 @@ def rc_trigger_launch(lf):
         auth = base64.b64encode(("riot:%s" % lf["password"]).encode()).decode()
         req = urllib.request.Request(url, data=b"{}", method="POST",
             headers={"Authorization": "Basic " + auth, "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, context=_CTX, timeout=10) as r:
+        with urllib.request.urlopen(req, context=_CTX, timeout=3) as r:
             body = r.read().decode().strip()
             print("Valorant launched via Riot Client API: %s" % body)
-            return True, "Valorant is starting (Riot Client API session %s)" % body
+            return True, "Valorant started (session %s)" % body
     except Exception as e:
-        print("Riot Client API launch call failed: %s" % e)
+        print("Riot Client API call note: %s" % e)
         return False, str(e)
 
-def launch():
-    if game_running():
-        return ["already-running"], None
+def _launch_worker():
+    global _launch_in_progress
+    try:
+        if game_running():
+            set_launch_status("Game is already running")
+            focus_valorant_window()
+            return
 
-    # Check candidate paths for RiotClientServices.exe
-    riot_client_path = r"C:\Riot Games\Riot Client\RiotClientServices.exe"
-    candidates = [
-        riot_client_path,
-        r"C:\Program Files\Riot Games\Riot Client\RiotClientServices.exe",
-        r"C:\Program Files (x86)\Riot Games\Riot Client\RiotClientServices.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Riot Games\Riot Client\RiotClientServices.exe"),
-    ]
-    rc_detected = find_rc_exe()
-    if rc_detected and rc_detected not in candidates:
-        candidates.insert(0, rc_detected)
+        set_launch_status("Checking Riot Client status...")
 
-    chosen_rc = None
-    for p in candidates:
-        if p and os.path.exists(p):
-            chosen_rc = p
-            break
-
-    # 1. If Riot Client lockfile is already active, trigger product-launcher API immediately
-    lf = read_lockfile()
-    if lf:
-        ok, msg = rc_trigger_launch(lf)
-        if ok:
-            return [msg], None
-
-    # 2. If Riot Client is not active or lockfile was absent, launch Riot Client process
-    if chosen_rc:
-        try:
-            cwd = os.path.dirname(chosen_rc)
-            subprocess.Popen([chosen_rc, "--launch-product=valorant", "--launch-patchline=live"], cwd=cwd)
-            print("Riot Client spawned: %s" % chosen_rc)
-        except Exception as e:
-            print("Failed spawning Riot Client: %s" % e)
-
-        # Wait for Riot Client to initialize and create lockfile (up to 15s)
-        lf = wait_lockfile(15)
+        # Step 1: Check if Riot Client is already active with lockfile
+        lf = read_lockfile()
         if lf:
-            # Send the Foundation launch request to guarantee the game starts
-            ok, msg = rc_trigger_launch(lf)
-            if ok:
-                return [msg], None
+            set_launch_status("Riot Client active (port %d). Attempting API launch..." % lf["port"])
+            for attempt in range(4):
+                ok, msg = rc_trigger_launch(lf)
+                if ok:
+                    set_launch_status("Game launched via Riot Client API: %s" % msg)
+                    focus_valorant_window()
+                    return
+                time.sleep(1.0)
 
-        return ["Valorant launch command sent to Riot Client"], None
+        # Step 2: Launch VALORANT.exe directly
+        val_exe = find_valorant_launcher_exe()
+        if val_exe:
+            set_launch_status("Launching VALORANT.exe (%s)..." % val_exe)
+            try:
+                subprocess.Popen([val_exe], cwd=os.path.dirname(val_exe))
+                for _ in range(8):
+                    time.sleep(1.0)
+                    if game_running():
+                        set_launch_status("Valorant process detected and running!")
+                        focus_valorant_window()
+                        return
+            except Exception as e:
+                print("Failed spawning VALORANT.exe: %s" % e)
 
-    # Fallback to direct game exe if Riot Client not found
-    game = find_game_exe()
-    if game:
-        try:
-            subprocess.Popen([game], cwd=os.path.dirname(game))
-            return ["Valorant is starting (direct exe)..."], None
-        except Exception as e:
-            return None, "direct launch blocked: %s" % e
+        # Step 3: Spawn Riot Client with patchline args
+        rc_exe = find_rc_exe() or r"C:\Riot Games\Riot Client\RiotClientServices.exe"
+        if os.path.exists(rc_exe):
+            set_launch_status("Spawning Riot Client with patchline args...")
+            try:
+                subprocess.Popen([rc_exe, "--launch-product=valorant", "--launch-patchline=live"],
+                                 cwd=os.path.dirname(rc_exe))
+            except Exception as e:
+                print("Failed spawning RiotClientServices.exe: %s" % e)
 
-    return None, "Riot Client path not found. Please check the installation path."
+            for i in range(12):
+                time.sleep(1.0)
+                if game_running():
+                    set_launch_status("Valorant game process running!")
+                    focus_valorant_window()
+                    return
+                lf = read_lockfile()
+                if lf:
+                    ok, msg = rc_trigger_launch(lf)
+                    if ok:
+                        set_launch_status("Valorant launched via Riot Client API!")
+                        focus_valorant_window()
+                        return
+
+        focus_riot_client()
+        if game_running():
+            set_launch_status("Valorant is active!")
+        else:
+            set_launch_status("Riot Client is open. Please verify login.")
+    except Exception as e:
+        set_launch_status("Launch error: %s" % e)
+    finally:
+        _launch_in_progress = False
+
+def trigger_launch_async():
+    global _launch_in_progress
+    if game_running():
+        focus_valorant_window()
+        return "Game is already running"
+
+    if not _launch_in_progress:
+        _launch_in_progress = True
+        t = threading.Thread(target=_launch_worker, daemon=True)
+        t.start()
+        return "Initiated Valorant launch sequence on clean PC"
+    else:
+        return "Launch sequence already in progress: %s" % _last_launch_status
+
+def launch():
+    msg = trigger_launch_async()
+    return [msg], None
 
 def kill_game():
+    set_launch_status("Game terminated")
     subprocess.run(["taskkill", "/F", "/IM", GAME_EXE], capture_output=True)
     subprocess.run(["taskkill", "/F", "/IM", "VALORANT.exe"], capture_output=True)
     subprocess.run(["taskkill", "/F", "/IM", "RiotClientServices.exe"], capture_output=True)
