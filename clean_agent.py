@@ -817,17 +817,7 @@ def get_presence_state():
         if err or not data or "presences" not in data:
             return None
         
-        puuid, _ = get_puuid()
         for p in data.get("presences", []):
-            prod = (p.get("product") or "").lower()
-            p_puuid = p.get("puuid")
-            
-            # Match our player or product valorant
-            if puuid and p_puuid and p_puuid != puuid:
-                continue
-            if not puuid and prod != "valorant":
-                continue
-            
             priv_b64 = p.get("private")
             if not priv_b64:
                 continue
@@ -919,7 +909,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pres = get_presence_state() if running else None
 
                 loading_stage = ""
-                if pres:
+                if pres and (pres.get("loop_state") or pres.get("party_state")):
                     loop = pres.get("loop_state") or ""
                     party = pres.get("party_state") or ""
                     map_name = pres.get("map_name") or "Unknown"
@@ -956,29 +946,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         ready_to_play = True
                         loading_stage = "Lobby Ready"
                     else:
-                        state = "loading"
-                        ready_to_play = False
-                        loading_stage = "Connecting to lobby..."
+                        state = "menus"
+                        ready_to_play = True
+                        loading_stage = "Lobby Ready"
                 elif running:
-                    # Game process IS running, but presence has NOT confirmed MENUS yet!
-                    # The game is currently initializing engine, anti-cheat, or loading shaders.
-                    state = "loading"
-                    ready_to_play = False
-                    since = "loading"
-                    line = "Valorant is launching and loading assets..."
-
-                    if not win["exists"]:
-                        loading_stage = "Bootstrapping Valorant..."
+                    # Check fast log watcher
+                    fast_state, fast_line = get_fast_log_state()
+                    if fast_state in ("in_game", "agent_locked", "agent_select"):
+                        state = fast_state
+                        since = "log-fast"
+                        line = fast_line
+                        ready_to_play = False
+                        loading_stage = fast_state
                     else:
-                        lf = read_lockfile()
-                        if not lf:
-                            loading_stage = "Starting Riot services..."
+                        # Check Party API
+                        pid, perr = party_id()
+                        if pid:
+                            state = "menus"
+                            since = "party-api"
+                            line = "Party active: " + str(pid)
+                            ready_to_play = True
+                            loading_stage = "Lobby Ready"
                         else:
-                            fast_st, fast_ln = get_fast_log_state()
-                            if "PlatformInitializer" in fast_ln or "Beginning platform" in fast_ln:
-                                loading_stage = "Initializing platform & anti-cheat..."
-                            elif "LogGameFlowStateManager" in fast_ln:
-                                loading_stage = "Connecting to matchmaking..."
+                            # Still initializing
+                            state = "loading"
+                            ready_to_play = False
+                            since = "loading"
+                            line = "Valorant engine loading..."
+                            if not win["exists"]:
+                                loading_stage = "Bootstrapping Valorant..."
                             else:
                                 loading_stage = "Loading engine & shaders..."
                 else:
@@ -988,8 +984,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     line = "Game not running"
                     loading_stage = "Offline"
 
-                # Loading check — strictly True while game is running until ready_to_play
-                is_loading = (running and not ready_to_play and state not in ("agent_select", "in_game", "queued", "match_found"))
+                # Loading check — strictly True while game is running until ready_to_play or match active
+                is_loading = (running and not ready_to_play and state not in ("agent_select", "in_game", "queued", "match_found", "agent_locked"))
 
                 self._send({
                     "ok": True,
@@ -1005,6 +1001,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "map": map_name,
                     "queue_elapsed_secs": queue_elapsed_secs,
                 })
+
             elif path == "/window/focus":
                 ok, msg = focus_valorant_window()
                 self._send({"ok": ok, "message": msg, "window": get_window_info()})
