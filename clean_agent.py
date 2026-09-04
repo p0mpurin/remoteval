@@ -265,11 +265,29 @@ def game_running():
 def detect_state():
     if not game_running():
         return "offline", "?", "game not running"
-    for line in reversed(tail_lines()):
+    lines = tail_lines(400)
+    if not lines:
+        return "loading", "?", "no log data"
+
+    # Scan all recent lines and pick the HIGHEST PRIORITY match.
+    # This prevents stale low-priority lines (loading/queued) from
+    # overriding a more recent high-priority state (menus/in_game).
+    best_name = None
+    best_pri = -1
+    best_since = "?"
+    best_line = ""
+
+    for line in lines:
         for rx, name, pri in MARKERS:
-            if rx.search(line):
+            if rx.search(line) and pri > best_pri:
                 m = re.search(r"\[(\d{4}\.\d{2}\.\d{2})-(\d{2}:\d{2}:\d{2}:\d{3})\]?", line)
-                return name, m.group(0) if m else "?", line.strip()[:200]
+                best_name = name
+                best_pri = pri
+                best_since = m.group(0) if m else "?"
+                best_line = line.strip()[:200]
+
+    if best_name:
+        return best_name, best_since, best_line
     return "loading", "?", "initializing game"
 
 def wait_lockfile(seconds):
