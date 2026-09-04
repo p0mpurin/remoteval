@@ -715,14 +715,19 @@ def pick_agent(name):
     agent_id = AGENTS.get(name)
     if not agent_id:
         return {"ok": False, "error": "unknown agent: %s" % name}
-    data, err = glz("GET", "/pregame/v1/players/me")
-    if err:
-        return {"ok": False, "error": err}
+    puuid, err = get_puuid()
+    if err or not puuid:
+        return {"ok": False, "error": "no puuid: %s" % err}
+    data, err = glz("GET", "/pregame/v1/players/%s" % puuid)
+    if err or not data:
+        return {"ok": False, "error": err or "no pregame data"}
     mid = data.get("MatchID") or data.get("matchId")
     if not mid:
         return {"ok": False, "error": "not in a pregame match"}
-    sel, err1 = glz("POST", "/pregame/v1/matches/%s/select" % mid, {"agentId": agent_id})
-    lock, err2 = glz("POST", "/pregame/v1/matches/%s/lock" % mid, {})
+    print("[PICK] Selecting agent %s (%s) in match %s" % (name, agent_id, mid[:8]))
+    sel, err1 = glz("POST", "/pregame/v1/matches/%s/select" % mid, {"ID": agent_id})
+    lock, err2 = glz("POST", "/pregame/v1/matches/%s/lock" % mid, {"ID": agent_id})
+    print("[PICK] select err=%s lock err=%s" % (err1, err2))
     return {"ok": err1 is None and err2 is None, "match": mid, "agent": name,
             "select_err": err1, "lock_err": err2}
 
@@ -753,30 +758,69 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
                 map_name = "Unknown"
                 pregame_mid = None
+                coregame_mid = None
                 ready_to_play = False
-                if running:
-                    # Check if player party exists (game is in menu & ready for queue)
+                queue_elapsed_secs = -1  # -1 = not in queue
+
+                puuid, _ = get_puuid() if running else (None, None)
+
+                if running and puuid:
+                    # ── Party / queue state ────────────────────────────────
                     try:
-                        pid, _ = party_id()
+                        pid, perr = party_id()
                         if pid:
                             ready_to_play = True
+                            # Get actual queue start time from party MatchmakingData
+                            pdata, _ = glz("GET", "/parties/v1/parties/%s" % pid)
+                            if pdata:
+                                mm = pdata.get("MatchmakingData") or {}
+                                qet = mm.get("QueueEntryTime", "")  # ISO timestamp
+                                if qet and qet != "0001-01-01T00:00:00Z":
+                                    import datetime
+                                    try:
+                                        # Parse ISO 8601 and compute elapsed seconds
+                                        qet_clean = qet.split(".")[0].rstrip("Z")
+                                        qt = datetime.datetime.strptime(qet_clean, "%Y-%m-%dT%H:%M:%S")
+                                        now = datetime.datetime.utcnow()
+                                        queue_elapsed_secs = max(0, int((now - qt).total_seconds()))
+                                    except Exception:
+                                        pass
                     except Exception:
                         pass
 
+                    # ── Pregame (agent select) ─────────────────────────────
                     try:
-                        p_me, _ = glz("GET", "/pregame/v1/players/me")
-                        if p_me and (p_me.get("MatchID") or p_me.get("matchId")):
-                            pregame_mid = p_me.get("MatchID") or p_me.get("matchId")
+                        p_pre, _ = glz("GET", "/pregame/v1/players/%s" % puuid)
+                        if p_pre and (p_pre.get("MatchID") or p_pre.get("matchId")):
+                            pregame_mid = p_pre.get("MatchID") or p_pre.get("matchId")
                             match_data, _ = glz("GET", "/pregame/v1/matches/%s" % pregame_mid)
                             if match_data:
                                 map_name = resolve_map_name(match_data.get("MapID", ""))
                     except Exception:
                         pass
 
+                    # ── Coregame (in active match / 5v5 screen) ────────────
+                    if not pregame_mid:
+                        try:
+                            cg, _ = glz("GET", "/core-game/v1/players/%s" % puuid)
+                            if cg and (cg.get("MatchID") or cg.get("matchId")):
+                                coregame_mid = cg.get("MatchID") or cg.get("matchId")
+                                cg_data, _ = glz("GET", "/core-game/v1/matches/%s" % coregame_mid)
+                                if cg_data:
+                                    map_name = resolve_map_name(cg_data.get("MapID", ""))
+                        except Exception:
+                            pass
+
+                # ── Determine authoritative state ──────────────────────────
                 if pregame_mid:
                     state = "agent_select"
                     since = "live-pregame"
-                    line = "Pregame match active: " + str(pregame_mid)
+                    line = "Pregame match: " + str(pregame_mid)
+                elif coregame_mid:
+                    state = "in_game"
+                    since = "live-coregame"
+                    line = "Coregame match: " + str(coregame_mid)
+                    ready_to_play = False
                 else:
                     state, since, line = detect_state()
                     if state in ("menus", "LOBBY"):
@@ -784,7 +828,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     elif ready_to_play and state in ("loading", "offline"):
                         state = "menus"
 
-                # If the game is already in menus or active match, it is NOT loading
+                # Loading only if game is running and truly loading
                 if state in ("menus", "LOBBY", "agent_select", "in_game", "queued", "match_found", "postgame") or ready_to_play:
                     is_loading = False
                 elif running and state == "loading":
@@ -803,7 +847,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "state_since": since,
                     "last_state_line": line,
                     "map": map_name,
-                    "pregame_id": pregame_mid
+                    "pregame_id": pregame_mid,
+                    "coregame_id": coregame_mid,
+                    "queue_elapsed_secs": queue_elapsed_secs,
                 })
             elif path == "/window/focus":
                 ok, msg = focus_valorant_window()
