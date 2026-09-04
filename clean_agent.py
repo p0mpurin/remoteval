@@ -235,7 +235,8 @@ MARKERS = [
     (re.compile(r"Pregame_GetPlayer|LogPregameManager", re.I),         "agent_select", 30),
     (re.compile(r"Match.?Found|FoundMatch|matchmaking.*found", re.I),  "match_found",  25),
     (re.compile(r"MM: |MatchmakingManager", re.I),                     "queued",       20),
-    (re.compile(r"main/lobby|LogUINavigationModel", re.I),             "menus",        10),
+    (re.compile(r"main/lobby|LogUINavigationModel|MainMenu|Entering state: MainMenu|PartyManager", re.I), "menus", 10),
+    (re.compile(r"LogPlatformInitializerV2|PlatformInitializer|Beginning platform|LogGameFlowStateManager: Reconcile.*Initialization|LogInit:", re.I), "loading", 5),
 ]
 
 def tail_lines(n=300):
@@ -263,13 +264,13 @@ def game_running():
 
 def detect_state():
     if not game_running():
-        return "menus", "?", "game not running"
+        return "offline", "?", "game not running"
     for line in reversed(tail_lines()):
         for rx, name, pri in MARKERS:
             if rx.search(line):
                 m = re.search(r"\[(\d{4}\.\d{2}\.\d{2})-(\d{2}:\d{2}:\d{2}:\d{3})\]?", line)
                 return name, m.group(0) if m else "?", line.strip()[:200]
-    return "menus", "?", ""
+    return "loading", "?", "initializing game"
 
 def wait_lockfile(seconds):
     for _ in range(seconds * 2):
@@ -554,7 +555,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
                 map_name = "Unknown"
                 pregame_mid = None
+                ready_to_play = False
                 if running:
+                    # Check if player party exists (game is in menu & ready for queue)
+                    try:
+                        pid, _ = party_id()
+                        if pid:
+                            ready_to_play = True
+                    except Exception:
+                        pass
+
                     try:
                         p_me, _ = glz("GET", "/pregame/v1/players/me")
                         if p_me and (p_me.get("MatchID") or p_me.get("matchId")):
@@ -571,10 +581,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     line = "Pregame match active: " + str(pregame_mid)
                 else:
                     state, since, line = detect_state()
+                    if ready_to_play and state in ("loading", "offline"):
+                        state = "menus"
+
+                is_loading = (running and (state == "loading" or not ready_to_play) and state not in ("agent_select", "in_game", "queued", "match_found", "postgame"))
+                if not running:
+                    is_loading = False
 
                 self._send({
                     "ok": True,
                     "game": running,
+                    "loading": is_loading,
+                    "ready_to_play": ready_to_play,
                     "window": win,
                     "state": state,
                     "state_since": since,
