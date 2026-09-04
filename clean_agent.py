@@ -282,29 +282,43 @@ def wait_lockfile(seconds):
 def launch():
     if game_running():
         return ["already-running"], None
-    rc = find_rc_exe()
-    lf = read_lockfile()
-    if rc and not lf:
-        subprocess.Popen([rc])
-        lf = wait_lockfile(25)
-    if lf:
-        try:
-            url = "https://127.0.0.1:%d/product-launch/v1/launch-product/valorant/patchline/live" % lf["port"]
-            auth = base64.b64encode(("riot:%s" % lf["password"]).encode()).decode()
-            req = urllib.request.Request(url, data=b"", method="POST",
-                headers={"Authorization": "Basic " + auth})
-            with urllib.request.urlopen(req, context=_CTX, timeout=20) as r:
-                return ["rc-api (game launch via Riot Client)"], None
-        except Exception:
-            pass
+
+    # Path to the Riot Client or Valorant shortcut/executable
+    # Update this path if your installation is in a different directory
+    riot_client_path = r"C:\Riot Games\Riot Client\RiotClientServices.exe"
+
+    candidates = [
+        riot_client_path,
+        r"C:\Program Files\Riot Games\Riot Client\RiotClientServices.exe",
+        r"C:\Program Files (x86)\Riot Games\Riot Client\RiotClientServices.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Riot Games\Riot Client\RiotClientServices.exe"),
+    ]
+
+    rc_detected = find_rc_exe()
+    if rc_detected and rc_detected not in candidates:
+        candidates.insert(0, rc_detected)
+
+    for p in candidates:
+        if p and os.path.exists(p):
+            try:
+                # Arguments to launch Valorant directly via Riot Client
+                # --launch-product=valorant --launch-patchline=live
+                subprocess.Popen([p, "--launch-product=valorant", "--launch-patchline=live"])
+                print("Valorant is starting...")
+                return ["Valorant is starting..."], None
+            except Exception as e:
+                print("Launch failed on %s: %s" % (p, e))
+
+    # Fallback to direct game exe if Riot Client not found
     game = find_game_exe()
     if game:
         try:
             subprocess.Popen([game])
-            return ["game exe (direct - needs vanguard off)"], None
+            return ["Valorant is starting (direct exe)..."], None
         except Exception as e:
-            return None, "direct launch blocked: %s (vanguard running? use the RC API)" % e
-    return None, "nothing to launch"
+            return None, "direct launch blocked: %s" % e
+
+    return None, "Riot Client path not found. Please check the installation path."
 
 def kill_game():
     subprocess.run(["taskkill", "/F", "/IM", GAME_EXE], capture_output=True)
