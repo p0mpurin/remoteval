@@ -235,7 +235,7 @@ MARKERS = [
     (re.compile(r"Pregame_GetPlayer|LogPregameManager", re.I),         "agent_select", 30),
     (re.compile(r"Match.?Found|FoundMatch|matchmaking.*found", re.I),  "match_found",  25),
     (re.compile(r"MM: |MatchmakingManager", re.I),                     "queued",       20),
-    (re.compile(r"main/lobby|LogUINavigationModel|MainMenu|Entering state: MainMenu|PartyManager", re.I), "menus", 10),
+    (re.compile(r"HomeScreen|MainMenu|TransitionToMainMenu|Party_FetchCustomGameConfigs|main/lobby|LogUINavigationModel|Entering state: MainMenu|PartyManager", re.I), "menus", 10),
     (re.compile(r"LogPlatformInitializerV2|PlatformInitializer|Beginning platform|LogGameFlowStateManager: Reconcile.*Initialization|LogInit:", re.I), "loading", 5),
 ]
 
@@ -378,13 +378,17 @@ def _launch_worker():
                     return
                 time.sleep(1.0)
 
-        # Step 2: Launch VALORANT.exe directly
+        # Step 2: Launch VALORANT.exe directly via Windows Shell
         val_exe = find_valorant_launcher_exe()
         if val_exe:
             set_launch_status("Launching VALORANT.exe (%s)..." % val_exe)
             try:
-                subprocess.Popen([val_exe], cwd=os.path.dirname(val_exe))
-                for _ in range(8):
+                # Use os.startfile or ShellExecuteW to avoid [WinError 5] Access is denied
+                try:
+                    os.startfile(val_exe)
+                except Exception:
+                    ctypes.windll.shell32.ShellExecuteW(None, "open", val_exe, None, os.path.dirname(val_exe), 1)
+                for _ in range(10):
                     time.sleep(1.0)
                     if game_running():
                         set_launch_status("Valorant process detected and running!")
@@ -398,12 +402,15 @@ def _launch_worker():
         if os.path.exists(rc_exe):
             set_launch_status("Spawning Riot Client with patchline args...")
             try:
-                subprocess.Popen([rc_exe, "--launch-product=valorant", "--launch-patchline=live"],
-                                 cwd=os.path.dirname(rc_exe))
+                try:
+                    ctypes.windll.shell32.ShellExecuteW(None, "open", rc_exe, "--launch-product=valorant --launch-patchline=live", os.path.dirname(rc_exe), 1)
+                except Exception:
+                    subprocess.Popen([rc_exe, "--launch-product=valorant", "--launch-patchline=live"],
+                                     cwd=os.path.dirname(rc_exe))
             except Exception as e:
                 print("Failed spawning RiotClientServices.exe: %s" % e)
 
-            for i in range(12):
+            for i in range(14):
                 time.sleep(1.0)
                 if game_running():
                     set_launch_status("Valorant game process running!")
@@ -537,7 +544,7 @@ def rso_entitlements(access_token):
     except Exception as e:
         return None, "entitlements failed: %s" % e
 
-CLIENT_VERSION = "release-13.04-shipping-20-5340415"
+CLIENT_VERSION = "release-13.05-shipping-11-5350494"
 CLIENT_PLATFORM = base64.b64encode(json.dumps({
     "platformType": "PC",
     "platformOS": "Windows",
@@ -652,13 +659,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
     def _send(self, obj):
-        data = json.dumps(obj).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            data = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+            pass
+        except Exception as e:
+            pass
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -695,18 +707,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     line = "Pregame match active: " + str(pregame_mid)
                 else:
                     state, since, line = detect_state()
-                    if ready_to_play and state in ("loading", "offline"):
+                    if state in ("menus", "LOBBY"):
+                        ready_to_play = True
+                    elif ready_to_play and state in ("loading", "offline"):
                         state = "menus"
 
-                is_loading = (running and (state == "loading" or not ready_to_play) and state not in ("agent_select", "in_game", "queued", "match_found", "postgame"))
-                if not running:
+                # If the game is already in menus or active match, it is NOT loading
+                if state in ("menus", "LOBBY", "agent_select", "in_game", "queued", "match_found", "postgame") or ready_to_play:
+                    is_loading = False
+                elif running and state == "loading":
+                    is_loading = True
+                else:
                     is_loading = False
 
                 self._send({
                     "ok": True,
                     "game": running,
                     "loading": is_loading,
-                    "ready_to_play": ready_to_play,
+                    "ready_to_play": ready_to_play or (state == "menus"),
                     "launch_status": get_launch_status(),
                     "window": win,
                     "state": state,
