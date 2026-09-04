@@ -272,17 +272,21 @@ _log_state_cache = {
 }
 _log_state_lock = threading.Lock()
 
-# Log markers for fast watcher — ordered by priority
+# Log markers for fast watcher — ordered highest priority first
+# The watcher scans new lines newest→oldest and takes the FIRST match.
 FAST_MARKERS = [
-    # in_game (highest — these fire when loading into the 5v5 map)
+    # ① Agent locked — earliest possible 5v5 signal, fires when lock-in completes
+    #    (~3-5s before MatchState:InProgress appears in the log)
+    (re.compile(r"Pregame_LockCharacter|LockCharacter", re.I), "agent_locked"),
+    # ② In-game (map loading)
     (re.compile(r"MatchState.*InProgress|LogMapLoadModel.*Match Setup: TRUE", re.I), "in_game"),
-    # agent_select / pregame
-    (re.compile(r"LogPregameManager|Pregame_GetPlayer|Initialized: PregameManager", re.I), "agent_select"),
-    # match found — brief popup before agent select
+    # ③ Agent select / pregame open
+    (re.compile(r"LogPregameManager|Pregame_GetPlayer|Initialized: PregameManager|Pregame_SelectCharacter", re.I), "agent_select"),
+    # ④ Match found — brief popup before agent select
     (re.compile(r"Match.?Found|FoundMatch|matchmaking.*found", re.I), "match_found"),
-    # back in menus
+    # ⑤ Back in menus
     (re.compile(r"HomeScreen|MainMenu|TransitionToMainMenu|PartyManager|Party_FetchCustomGameConfigs", re.I), "menus"),
-    # matchmaking
+    # ⑥ Matchmaking
     (re.compile(r"MM: |MatchmakingManager", re.I), "queued"),
 ]
 
@@ -890,9 +894,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     since = "live-coregame"
                     line = "Coregame match: " + str(coregame_mid)
                     ready_to_play = False
+                elif fast_state == "agent_locked" and running:
+                    # Pregame_LockCharacter fired — agent just locked, map loading imminent
+                    state = "agent_locked"
+                    since = "log-fast"
+                    line = fast_line
+                    ready_to_play = False
                 elif fast_state == "in_game" and running:
-                    # Log watcher already sees MatchState:InProgress — report in_game
-                    # even before the coregame API confirms it (API lags by ~1-2s)
                     state = "in_game"
                     since = "log-fast"
                     line = fast_line
