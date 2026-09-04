@@ -27,8 +27,38 @@ class DetectorTests(unittest.TestCase):
         self.presence()
         self.clock += .2
         self.presence()
-        self.assertEqual(self.s.snapshot()['phase'], 'LOADING')
+        self.assertEqual(self.s.snapshot()['phase'], 'MENUS')
         self.assertFalse(self.s.snapshot()['ready_to_play'])
+        self.assertFalse(self.s.snapshot()['degraded'])
+
+    def test_api_lobby_readiness_requires_all_evidence(self):
+        self.presence()
+        self.put('window', {'exists': True})
+        self.put('core', None)
+        self.put('pregame', None)
+        self.assertFalse(self.s.snapshot()['ready_to_play'])
+        self.clock += .2
+        self.presence()
+        self.assertTrue(self.s.snapshot()['ready_to_play'])
+        self.assertEqual(self.s.snapshot()['readiness_basis'], 'api')
+        self.assertFalse(self.s.snapshot()['lobby_visual_verified'])
+        self.put('pregame', 'match-1')
+        self.assertFalse(self.s.snapshot()['ready_to_play'])
+
+    def test_api_readiness_expires_and_resets(self):
+        self.presence()
+        self.clock += .2
+        self.presence()
+        self.put('window', {'exists': True})
+        self.put('core', None)
+        self.put('pregame', None)
+        self.assertTrue(self.s.snapshot()['ready_to_play'])
+        self.clock += 3
+        self.s.process(self.s.identity)
+        self.presence()
+        self.assertFalse(self.s.snapshot()['ready_to_play'])
+        self.s.process(((43, 456),))
+        self.assertEqual(self.s.menu_samples, 0)
 
     def test_verified_lobby(self):
         self.presence()

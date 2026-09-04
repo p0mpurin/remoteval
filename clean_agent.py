@@ -1049,7 +1049,7 @@ class Config:
     client_version: str
     local_interval: float = .20
     transition_interval: float = .50
-    idle_interval: float = 3.0
+    idle_interval: float = 1.0
     freshness: float = 2.5
 
     def __post_init__(self):
@@ -1079,6 +1079,7 @@ class StateStore:
         self.queue_anchor = None
         self.presence_baseline = None
         self.presence_changed = False
+        self.menu_samples = 0
         self.lobby_verified_at = 0.
 
     def process(self, identity):
@@ -1092,6 +1093,7 @@ class StateStore:
                 self.queue_anchor = None
                 self.presence_baseline = None
                 self.presence_changed = False
+                self.menu_samples = 0
                 self.lobby_verified_at = 0.
                 self._transition("LOADING" if identity else "OFFLINE", "process")
 
@@ -1102,6 +1104,7 @@ class StateStore:
             self.queue_anchor = None
             self.presence_baseline = None
             self.presence_changed = False
+            self.menu_samples = 0
             self.lobby_verified_at = 0.
             self._transition("LOADING" if self.identity else "OFFLINE", "session_changed")
 
@@ -1117,6 +1120,10 @@ class StateStore:
             self.sources[source] = (started, data)
             self.errors.pop(source, None)
             if source == "presence":
+                if data.get("sessionLoopState") == "MENUS" and data.get("partyState") == "DEFAULT":
+                    self.menu_samples = min(2, self.menu_samples + 1) if old and now-old[0] <= self.freshness else 1
+                else:
+                    self.menu_samples = 0
                 digest = json.dumps(data, sort_keys=True)
                 if self.presence_baseline is None:
                     self.presence_baseline = digest
@@ -1164,7 +1171,7 @@ class StateStore:
             candidate, source = "AGENT_SELECT", "presence_match_found"
         elif loop == "MENUS" and party == "MATCHMAKING":
             candidate, source = "QUEUED", "presence"
-        elif loop == "MENUS" and party == "DEFAULT" and (self.presence_changed or now-self.lobby_verified_at <= .5):
+        elif loop == "MENUS" and party == "DEFAULT" and (self.menu_samples >= 2 or self.presence_changed or now-self.lobby_verified_at <= .5):
             candidate, source = "MENUS", "presence"
 
         # A negative lookup is absence only for that API. Require both APIs to
@@ -1198,8 +1205,13 @@ class StateStore:
         evidence = fresh.get(source)
         if source == "presence_match_found":
             evidence = fresh.get("presence")
+        # Unconfirmed startup presence is not a connectivity/freshness failure.
+        # Fresh responses can legitimately leave us waiting for lobby evidence.
         self.degraded = (now - self.process_at > 1.0 or
-                         (bool(self.identity) and (candidate is None or evidence is None)))
+                         (bool(self.identity) and
+                          ((candidate is None and self.state != "LOADING") or
+                           not any(k in fresh for k in ("presence", "core", "pregame")))))
+        self.state_confirmed = candidate is not None
         self.source = source if candidate else "last_known"
 
     def snapshot(self):
@@ -1207,7 +1219,15 @@ class StateStore:
             now = time.monotonic()
             self._reduce(now)
             visual = now - self.lobby_verified_at <= .5
-            ready = self.state == "MENUS" and visual and not self.degraded
+            def current(key):
+                entry = self.sources.get(key)
+                return entry is not None and now-entry[0] <= self.freshness
+            presence = self.sources.get("presence", (0, {}))[1] or {}
+            api_ready = (self.menu_samples >= 2 and current("presence") and
+                         presence.get("sessionLoopState") == "MENUS" and presence.get("partyState") == "DEFAULT" and
+                         current("window") and self.sources["window"][1].get("exists", False) and
+                         all(current(k) and self.sources[k][1] is None for k in ("core", "pregame")))
+            ready = self.state == "MENUS" and self.state_confirmed and (api_ready or visual) and not self.degraded
             elapsed = None
             if self.queue_anchor and not self.degraded:
                 elapsed = self.queue_anchor[2] + now - self.queue_anchor[1]
@@ -1216,8 +1236,12 @@ class StateStore:
                     "phase": self.state, "state_since": self.since,
                     "game": bool(self.identity), "loading": self.state == "LOADING",
                     "ready_to_play": ready, "lobby_visual_verified": visual,
+                    "readiness_basis": "visual" if ready and visual else "api" if ready else "unconfirmed",
                     "api_menu_candidate": self.state == "MENUS",
                     "degraded": self.degraded, "source": self.source,
+                    "state_confirmed": self.state_confirmed,
+                    "presence_loop": (self.sources.get("presence", (0, {}))[1] or {}).get("sessionLoopState"),
+                    "presence_party": (self.sources.get("presence", (0, {}))[1] or {}).get("partyState"),
                     "queue_elapsed_secs": elapsed,
                     "queue_entry_time": self.queue_anchor[0] if self.queue_anchor else None,
                     "queue_clock": "clean_pc_wall_clock_anchored_to_monotonic",
@@ -1263,6 +1287,7 @@ class Detector:
             try:
                 self.store.process(_shipping_processes())
                 self.window_cache = get_window_info()
+                self.store.observe("window", self.window_cache, self.store.generation)
             except OSError:
                 self.store.error("process", "process_inspection_failed")
             self.stop_event.wait(.15)
@@ -1518,7 +1543,7 @@ def main():
     print("clean_agent listening on 0.0.0.0:%d" % PORT)
     print("Single file / standard library / cached status detector active")
     print("Region=%s shard=%s client_version=%s" % (region, shard, version))
-    print("Visual lobby verification is not configured: ready_to_play stays false.")
+    print("Lobby readiness: fresh repeated MENUS presence + game window + no pregame/core match")
     print("endpoints: /status /window/focus /launch /kill /log /queue /cancel /pick")
     try:
         srv.serve_forever()

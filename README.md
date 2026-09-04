@@ -58,12 +58,13 @@ deduplicate notifications using `(instance_id, alert.id)`. No hard sub-second
 visual guarantee is possible from these APIs. The default transition polling
 interval is 500 ms per remote worker, subject to RTT and backoff.
 
-`ready_to_play` deliberately requires current visual lobby confirmation via
-`detector.store.verify_lobby(generation)`. No screen recognizer is bundled, so it
-remains false by default. `api_menu_candidate` reports backend menu evidence
-separately. The existing GUI must not override readiness merely because state is
-`menus`. This preserves the strict readiness contract rather than claiming that
-backend presence proves the lobby has rendered.
+`ready_to_play` uses automatic API readiness: two fresh own-player MENUS/DEFAULT
+presence samples, a detected game window, and fresh negative pregame and core-game
+lookups. Missing or expired evidence disables PLAY. Process/session changes reset
+the evidence. `readiness_basis=api` explicitly distinguishes this from visual proof;
+`lobby_visual_verified` stays false unless a separate verifier supplies it.
+The GUI must honor `ready_to_play`, not enable PLAY from `menus` alone. A fresh but
+unconfirmed startup state is no longer incorrectly marked as stale.
 
 Stop the queue animation whenever phase is not `QUEUED`, status is `degraded`, or
 communication goes stale. Anchor numeric `queue_elapsed_secs` to the GUI's steady
