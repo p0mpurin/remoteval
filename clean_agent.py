@@ -262,6 +262,71 @@ def game_running():
     except Exception:
         return False
 
+# ── FAST LOG WATCHER (background thread, 250ms tick) ────────────────
+# Watches ShooterGame.log in real-time to catch state transitions
+# (match_found, agent_select, in_game) without waiting for the API poll.
+_log_state_cache = {
+    "state": "unknown",     # fastest known state from log
+    "line": "",
+    "pos": 0,               # last read position in log file
+}
+_log_state_lock = threading.Lock()
+
+# Log markers for fast watcher — ordered by priority
+FAST_MARKERS = [
+    # in_game (highest — these fire when loading into the 5v5 map)
+    (re.compile(r"MatchState.*InProgress|LogMapLoadModel.*Match Setup: TRUE", re.I), "in_game"),
+    # agent_select / pregame
+    (re.compile(r"LogPregameManager|Pregame_GetPlayer|Initialized: PregameManager", re.I), "agent_select"),
+    # match found — brief popup before agent select
+    (re.compile(r"Match.?Found|FoundMatch|matchmaking.*found", re.I), "match_found"),
+    # back in menus
+    (re.compile(r"HomeScreen|MainMenu|TransitionToMainMenu|PartyManager|Party_FetchCustomGameConfigs", re.I), "menus"),
+    # matchmaking
+    (re.compile(r"MM: |MatchmakingManager", re.I), "queued"),
+]
+
+def _log_watcher():
+    global _log_state_cache
+    last_pos = 0
+    while True:
+        try:
+            if not os.path.exists(GAME_LOG):
+                time.sleep(1.0)
+                continue
+            sz = os.path.getsize(GAME_LOG)
+            if sz < last_pos:
+                last_pos = 0  # log rotated
+            if sz == last_pos:
+                time.sleep(0.25)
+                continue
+            with open(GAME_LOG, "rb") as f:
+                f.seek(last_pos)
+                chunk = f.read(min(sz - last_pos, 131072))
+            last_pos += len(chunk)
+            text = chunk.decode("utf-8", "replace")
+            for line in reversed(text.splitlines()):
+                for rx, name in FAST_MARKERS:
+                    if rx.search(line):
+                        with _log_state_lock:
+                            _log_state_cache["state"] = name
+                            _log_state_cache["line"] = line.strip()[:200]
+                        break
+                else:
+                    continue
+                break  # stop at first (most recent) match
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+# Start log watcher background thread
+threading.Thread(target=_log_watcher, daemon=True).start()
+
+def get_fast_log_state():
+    with _log_state_lock:
+        return _log_state_cache["state"], _log_state_cache["line"]
+
+
 def detect_state():
     if not game_running():
         return "offline", "?", "game not running"
@@ -723,11 +788,13 @@ def pick_agent(name):
         return {"ok": False, "error": err or "no pregame data"}
     mid = data.get("MatchID") or data.get("matchId")
     if not mid:
-        return {"ok": False, "error": "not in a pregame match"}
-    print("[PICK] Selecting agent %s (%s) in match %s" % (name, agent_id, mid[:8]))
-    sel, err1 = glz("POST", "/pregame/v1/matches/%s/select" % mid, {"ID": agent_id})
-    lock, err2 = glz("POST", "/pregame/v1/matches/%s/lock" % mid, {"ID": agent_id})
-    print("[PICK] select err=%s lock err=%s" % (err1, err2))
+        return {"ok": False, "error": "not in a pregame match (puuid=%s)" % puuid}
+    print("[PICK] Agent %s (%s) match=%s" % (name, agent_id, mid[:8]))
+    # Agent ID goes in the URL path, no body needed
+    sel, err1 = glz("POST", "/pregame/v1/matches/%s/select/%s" % (mid, agent_id), {})
+    print("[PICK] select -> err=%s resp=%s" % (err1, str(sel)[:120]))
+    lock, err2 = glz("POST", "/pregame/v1/matches/%s/lock/%s" % (mid, agent_id), {})
+    print("[PICK] lock   -> err=%s resp=%s" % (err2, str(lock)[:120]))
     return {"ok": err1 is None and err2 is None, "match": mid, "agent": name,
             "select_err": err1, "lock_err": err2}
 
@@ -812,6 +879,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             pass
 
                 # ── Determine authoritative state ──────────────────────────
+                fast_state, fast_line = get_fast_log_state()
+
                 if pregame_mid:
                     state = "agent_select"
                     since = "live-pregame"
@@ -821,6 +890,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     since = "live-coregame"
                     line = "Coregame match: " + str(coregame_mid)
                     ready_to_play = False
+                elif fast_state == "in_game" and running:
+                    # Log watcher already sees MatchState:InProgress — report in_game
+                    # even before the coregame API confirms it (API lags by ~1-2s)
+                    state = "in_game"
+                    since = "log-fast"
+                    line = fast_line
+                    ready_to_play = False
+                elif fast_state == "agent_select" and running:
+                    state = "agent_select"
+                    since = "log-fast"
+                    line = fast_line
                 else:
                     state, since, line = detect_state()
                     if state in ("menus", "LOBBY"):
