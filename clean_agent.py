@@ -885,6 +885,9 @@ import threading
 import time
 import uuid
 import zlib
+import socket
+import hashlib
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1160,10 +1163,132 @@ def capture_play_banner(identity):
 def timestamp(value):
     """Accept timezone-qualified ISO 8601 only; never invent a queue start."""
     try:
-        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = dt.datetime.strptime(value, "%Y.%m.%d-%H.%M.%S").replace(tzinfo=dt.timezone.utc)
+        if parsed.year < 2000:
+            return None
         return parsed.timestamp() if parsed.tzinfo else None
     except (ValueError, TypeError, AttributeError):
         return None
+
+
+def normalize_presence(private):
+    """Support Riot's current nested schema and the legacy flat schema."""
+    if not isinstance(private, dict) or private.get("isValid") is False:
+        raise ValueError("invalid_presence")
+    match = private.get("matchPresenceData") or {}
+    party = private.get("partyPresenceData") or {}
+    if not isinstance(match, dict) or not isinstance(party, dict):
+        raise ValueError("invalid_presence_sections")
+    result = {}
+    for key, section in (("sessionLoopState", match), ("partyState", party), ("queueEntryTime", party)):
+        value = section.get(key, private.get(key))
+        if value is not None:
+            result[key] = value
+    if result.get("sessionLoopState") not in ("MENUS", "PREGAME", "INGAME"):
+        raise ValueError("unknown_presence_state_schema")
+    result["schema"] = "nested" if match or party else "flat"
+    return result
+
+
+class RiotEvents:
+    """Minimal bounded RFC6455 text client, exclusively for Riot's loopback API."""
+    def __init__(self, port, password):
+        self.sock = None
+        self.buffer = bytearray()
+        self.fragments = bytearray()
+        self.fragmenting = False
+        try:
+            raw = socket.create_connection(("127.0.0.1", int(port)), timeout=1.)
+            self.sock = raw
+            self.sock = ssl._create_unverified_context().wrap_socket(raw, server_hostname="127.0.0.1")
+            self.sock.settimeout(1.)
+            key = base64.b64encode(os.urandom(16)).decode()
+            credentials = base64.b64encode(("riot:"+password).encode()).decode()
+            self.sock.sendall((f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{int(port)}\r\n"
+                               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+                               f"Authorization: Basic {credentials}\r\n\r\n").encode())
+            header = bytearray()
+            while b"\r\n\r\n" not in header:
+                chunk = self.sock.recv(4096)
+                if not chunk or len(header) > 65536:
+                    raise ValueError("websocket_handshake_failed")
+                header.extend(chunk)
+            lines, tail = bytes(header).split(b"\r\n\r\n", 1)
+            parts = lines.decode("latin1").split("\r\n")
+            fields = dict((k.strip().lower(), v.strip()) for k,v in
+                          (line.split(":",1) for line in parts[1:] if ":" in line))
+            expected = base64.b64encode(hashlib.sha1((key+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+            if (parts[0].split()[1] != "101" or fields.get("sec-websocket-accept") != expected or
+                fields.get("upgrade", "").lower() != "websocket"):
+                raise ValueError("websocket_upgrade_rejected")
+            self.buffer.extend(tail)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+
+    def send(self, payload, opcode=1):
+        if isinstance(payload, str):
+            payload = payload.encode()
+        mask = os.urandom(4)
+        size = len(payload)
+        head = bytes((0x80 | opcode, 0x80 | size)) if size < 126 else bytes((0x80 | opcode, 0xFE))+struct.pack('!H',size)
+        self.sock.sendall(head+mask+bytes(b ^ mask[i % 4] for i,b in enumerate(payload)))
+
+    def receive(self):
+        while True:
+            if len(self.buffer) >= 2:
+                first, second = self.buffer[:2]
+                opcode, final = first & 15, bool(first & 128)
+                if first & 0x70 or second & 128:
+                    raise ValueError("invalid_websocket_frame")
+                length, pos = second & 127, 2
+                extended = 2 if length == 126 else 8 if length == 127 else 0
+                if len(self.buffer) >= pos+extended:
+                    if extended:
+                        length = int.from_bytes(self.buffer[pos:pos+extended], 'big')
+                        pos += extended
+                    if length > 2*1024*1024 or (opcode >= 8 and (not final or length > 125)):
+                        raise ValueError("oversized_websocket_frame")
+                    if len(self.buffer) >= pos+length:
+                        payload = bytes(self.buffer[pos:pos+length])
+                        del self.buffer[:pos+length]
+                        if opcode == 8:
+                            raise OSError("websocket_closed")
+                        if opcode == 9:
+                            self.send(payload, 10)
+                            continue
+                        if opcode == 10:
+                            continue
+                        if opcode == 1 and not self.fragmenting:
+                            self.fragments.clear()
+                            self.fragmenting = True
+                        elif opcode != 0 or not self.fragmenting:
+                            raise ValueError("unexpected_websocket_opcode")
+                        self.fragments.extend(payload)
+                        if len(self.fragments) > 2*1024*1024:
+                            raise ValueError("oversized_websocket_message")
+                        if final:
+                            self.fragmenting = False
+                            message = self.fragments.decode('utf-8')
+                            self.fragments.clear()
+                            return message
+                        continue
+            try:
+                chunk = self.sock.recv(65536)
+            except socket.timeout:
+                return None  # preserve partial frames across idle timeouts
+            if not chunk:
+                raise OSError("websocket_closed")
+            self.buffer.extend(chunk)
 
 
 def jwt_exp(token):
@@ -1380,7 +1505,9 @@ class StateStore:
                     "state_confirmed": self.state_confirmed,
                     "presence_loop": (self.sources.get("presence", (0, {}))[1] or {}).get("sessionLoopState"),
                     "presence_party": (self.sources.get("presence", (0, {}))[1] or {}).get("partyState"),
+                    "presence_schema": (self.sources.get("presence", (0, {}))[1] or {}).get("schema"),
                     "visual_detection": copy.deepcopy(self.sources.get("visual", (0, {}))[1]),
+                    "event_stream": copy.deepcopy(self.sources.get("events", (0, {}))[1]),
                     "queue_elapsed_secs": elapsed,
                     "queue_entry_time": self.queue_anchor[0] if self.queue_anchor else None,
                     "queue_clock": "clean_pc_wall_clock_anchored_to_monotonic",
@@ -1402,10 +1529,11 @@ class Detector:
         self.window_cache = {"exists": False}
         self.refresh = threading.Event()
         self.remote_pause_until = 0.
+        self.remote_wake = {kind: threading.Event() for kind in ("core", "pregame", "party")}
         self.lockfile = Path(os.environ.get("LOCALAPPDATA", "")) / "Riot Games/Riot Client/Config/lockfile"
 
     def start(self):
-        for target in (self._process_loop, self._local_loop, self._visual_loop):
+        for target in (self._process_loop, self._local_loop, self._visual_loop, self._event_loop):
             self._spawn(target)
         for kind in ("core", "pregame", "party"):
             self._spawn(lambda k=kind: self._remote_loop(k))
@@ -1418,6 +1546,8 @@ class Detector:
 
     def close(self):
         self.stop_event.set()
+        for wake in self.remote_wake.values():
+            wake.set()
         for thread in self.threads:
             thread.join(timeout=3)
 
@@ -1472,6 +1602,73 @@ class Detector:
         session.trust_env = False
         return session
 
+    def _handle_event(self, message, subject, generation):
+        event = json.loads(message)
+        if not isinstance(event, list) or len(event) < 3 or event[0] != 8 or not isinstance(event[2], dict):
+            return
+        body = event[2]
+        uri = body.get("uri", "")
+        if uri == "/chat/v4/presences" and body.get("eventType") != "Delete":
+            data = body.get("data") or {}
+            rows = data.get("presences", []) if isinstance(data, dict) else data
+            for row in rows:
+                if row.get("puuid") == subject and row.get("product") == "valorant" and row.get("private"):
+                    presence = normalize_presence(json.loads(base64.b64decode(row["private"])))
+                    self.store.observe("presence", presence, generation)
+                    loop = presence["sessionLoopState"]
+                    self.remote_wake["core" if loop == "INGAME" else "pregame"].set()
+                    break
+        elif isinstance(uri, str) and uri.startswith("/riot-messaging-service/v1/message/"):
+            # RMS announces a changed resource, not necessarily a entered match.
+            # Wake the authoritative player lookup; never turn Delete into IN_GAME.
+            if "ares-core-game" in uri or "ares-coregame" in uri:
+                self.remote_wake["core"].set()
+            elif "ares-pregame" in uri:
+                self.remote_wake["pregame"].set()
+            elif "ares-parties" in uri:
+                self.remote_wake["party"].set()
+
+    def _event_loop(self):
+        failures = 0
+        while not self.stop_event.is_set():
+            connection = None
+            generation = self.store.generation
+            try:
+                with self.auth_lock:
+                    auth = self.auth
+                if not auth or not self.store.identity:
+                    self.stop_event.wait(.25)
+                    continue
+                raw = self.lockfile.read_text().strip()
+                _, _, port, password, _ = raw.split(":")
+                generation, subject = self.store.generation, auth[0]
+                connection = RiotEvents(port, password)
+                for name in ("OnJsonApiEvent_chat_v4_presences", "OnJsonApiEvent_riot-messaging-service_v1_message"):
+                    connection.send(json.dumps([5, name]))
+                failures = 0
+                count = 0
+                while not self.stop_event.is_set():
+                    if self.store.generation != generation or self.lockfile.read_text().strip() != raw:
+                        break
+                    message = connection.receive()
+                    if message is not None:
+                        try:
+                            self._handle_event(message, subject, generation)
+                            count += 1
+                        except (ValueError, TypeError, AttributeError, KeyError):
+                            self.store.error("events", "unrecognized_event_payload")
+                    self.store.observe("events", {"connected": True, "messages": count}, generation)
+            except (OSError, ValueError, KeyError, TypeError, IndexError):
+                failures += 1
+                self.store.error("events", "event_stream_unavailable_rest_polling_active")
+            finally:
+                if connection:
+                    connection.close()
+                    self.store.observe("events", {"connected": False}, generation)
+                    if failures:
+                        self.store.error("events", "event_stream_unavailable_rest_polling_active")
+            self.stop_event.wait(min(10., .5*2**min(failures, 4)))
+
     def _local_loop(self):
         fingerprint = None
         subject = None
@@ -1524,9 +1721,7 @@ class Detector:
                         own = next((p for p in rows if p.get("puuid") == subject and
                                     p.get("product") == "valorant"), None)
                         if own:
-                            private = json.loads(base64.b64decode(own["private"]))
-                            if not isinstance(private, dict):
-                                raise ValueError("invalid_presence")
+                            private = normalize_presence(json.loads(base64.b64decode(own["private"])))
                             self.store.observe("presence", private, generation, started)
                         else:
                             self.store.error("presence", "self_presence_missing")
@@ -1549,6 +1744,7 @@ class Detector:
         with self._session() as session:
             while not self.stop_event.is_set():
                 began = time.monotonic()
+                self.remote_wake[kind].clear()
                 with self.auth_lock:
                     auth = self.auth
                     pause = self.remote_pause_until
@@ -1605,7 +1801,13 @@ class Detector:
                     interval = max(interval, 3.)
                 if failures:
                     interval = max(interval, min(30., 2**min(failures, 5)) + random.random())
-                self.stop_event.wait(max(.01, interval - (time.monotonic()-began)))
+                # Events shorten an idle poll delay, but never bypass failure backoff
+                # or allow requests closer than the configured transition interval.
+                if failures:
+                    self.stop_event.wait(max(.01, interval-(time.monotonic()-began)))
+                else:
+                    self.stop_event.wait(max(0., self.config.transition_interval-(time.monotonic()-began)))
+                    self.remote_wake[kind].wait(max(0., interval-(time.monotonic()-began)))
 
     @staticmethod
     def _retry_after(value):

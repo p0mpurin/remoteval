@@ -19,6 +19,8 @@ Lightweight remote companion agent for 2PC VALORANT setups. Runs on the clean/se
   - Core-game takes precedence over pregame, which takes precedence over queueing.
   - Queue time comes from Riot's queue timestamp; transition alerts remain available across missed polls.
   - Authentication is cached from the running Riot Client, with expiration and rate-limit handling.
+  - Both current nested presence (`matchPresenceData` / `partyPresenceData`) and legacy flat presence are supported.
+  - Local WebSocket presence events update state immediately; Riot messaging events wake the relevant REST lookup.
   - Logs remain diagnostic only. The status map is currently `Unknown`.
 - **Zero External Dependencies**:
   - Uses only Python standard library + built-in `ctypes`.
@@ -49,6 +51,36 @@ The agent retains the existing region discovery and bundled client-version defau
 If they do not match your installation, `VAL_REGION`, `VAL_SHARD`, and
 `VAL_CLIENT_VERSION` can override them. Startup prints the selected values; the
 bundled client version is not automatically updated when Riot releases a patch.
+
+### Presence schema and fast transitions
+
+The actual current client observed during debugging returns the lobby fields at
+`matchPresenceData.sessionLoopState` and `partyPresenceData.partyState`. Reading
+only the legacy root fields leaves them null and can strand the GUI in LOADING.
+Both layouts now pass through the same normalizer for polling and WebSocket events.
+`presence_schema` in `/status` reports `nested` or `flat`.
+
+The built-in loopback WebSocket client subscribes to
+`OnJsonApiEvent_chat_v4_presences` and
+`OnJsonApiEvent_riot-messaging-service_v1_message`. Own-player PREGAME/INGAME
+presence events update phase immediately. RMS resource messages only request a
+fresh authoritative lookup; a deletion is not treated as match entry. REST polling
+continues if the socket is unavailable. Reconnects use backoff and session changes
+invalidate previous observations. `/status.event_stream` reports connection health.
+
+Match-found/core-game behavior is covered by synthetic transition and transport
+tests. Live lobby readiness and the WebSocket handshake were verified on the user's
+running client. No live match was queued or killed during validation. IN_GAME is a
+backend transition signal, not frame-exact recognition of the 10-player card screen.
+
+Research sources:
+
+- [Current presence handling in a client implementation](https://github.com/zayKenyon/VALORANT-rank-yoinker/blob/3ae9f18a68cc71bd347df2b16b5c3a1c52c9d93a/src/presences.py)
+- [Local WebSocket endpoint](https://valapidocs.techchrism.me/endpoint/local-websocket)
+- [Pre-game player lookup](https://valapidocs.techchrism.me/endpoint/pre-game-player)
+- [Core-game player lookup](https://valapidocs.techchrism.me/endpoint/current-game-player)
+- [Microsoft: PrintWindow asks the owning app to render](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-printwindow)
+- [Microsoft: Windows Graphics Capture for application frames](https://learn.microsoft.com/en-us/windows/apps/develop/media-authoring-processing/screen-capture)
 
 ### Detection limits and GUI contract
 
