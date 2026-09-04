@@ -707,6 +707,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "game": running,
                     "loading": is_loading,
                     "ready_to_play": ready_to_play,
+                    "launch_status": get_launch_status(),
                     "window": win,
                     "state": state,
                     "state_since": since,
