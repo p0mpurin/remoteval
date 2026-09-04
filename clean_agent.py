@@ -279,41 +279,74 @@ def wait_lockfile(seconds):
         time.sleep(0.5)
     return None
 
+def rc_trigger_launch(lf):
+    """Trigger Valorant launch via Riot Client's internal Foundation API."""
+    try:
+        url = "https://127.0.0.1:%d/product-launcher/v1/products/valorant/patchlines/live" % lf["port"]
+        auth = base64.b64encode(("riot:%s" % lf["password"]).encode()).decode()
+        req = urllib.request.Request(url, data=b"{}", method="POST",
+            headers={"Authorization": "Basic " + auth, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, context=_CTX, timeout=10) as r:
+            body = r.read().decode().strip()
+            print("Valorant launched via Riot Client API: %s" % body)
+            return True, "Valorant is starting (Riot Client API session %s)" % body
+    except Exception as e:
+        print("Riot Client API launch call failed: %s" % e)
+        return False, str(e)
+
 def launch():
     if game_running():
         return ["already-running"], None
 
-    # Path to the Riot Client or Valorant shortcut/executable
-    # Update this path if your installation is in a different directory
+    # Check candidate paths for RiotClientServices.exe
     riot_client_path = r"C:\Riot Games\Riot Client\RiotClientServices.exe"
-
     candidates = [
         riot_client_path,
         r"C:\Program Files\Riot Games\Riot Client\RiotClientServices.exe",
         r"C:\Program Files (x86)\Riot Games\Riot Client\RiotClientServices.exe",
         os.path.expandvars(r"%LOCALAPPDATA%\Riot Games\Riot Client\RiotClientServices.exe"),
     ]
-
     rc_detected = find_rc_exe()
     if rc_detected and rc_detected not in candidates:
         candidates.insert(0, rc_detected)
 
+    chosen_rc = None
     for p in candidates:
         if p and os.path.exists(p):
-            try:
-                # Arguments to launch Valorant directly via Riot Client
-                # --launch-product=valorant --launch-patchline=live
-                subprocess.Popen([p, "--launch-product=valorant", "--launch-patchline=live"])
-                print("Valorant is starting...")
-                return ["Valorant is starting..."], None
-            except Exception as e:
-                print("Launch failed on %s: %s" % (p, e))
+            chosen_rc = p
+            break
+
+    # 1. If Riot Client lockfile is already active, trigger product-launcher API immediately
+    lf = read_lockfile()
+    if lf:
+        ok, msg = rc_trigger_launch(lf)
+        if ok:
+            return [msg], None
+
+    # 2. If Riot Client is not active or lockfile was absent, launch Riot Client process
+    if chosen_rc:
+        try:
+            cwd = os.path.dirname(chosen_rc)
+            subprocess.Popen([chosen_rc, "--launch-product=valorant", "--launch-patchline=live"], cwd=cwd)
+            print("Riot Client spawned: %s" % chosen_rc)
+        except Exception as e:
+            print("Failed spawning Riot Client: %s" % e)
+
+        # Wait for Riot Client to initialize and create lockfile (up to 15s)
+        lf = wait_lockfile(15)
+        if lf:
+            # Send the Foundation launch request to guarantee the game starts
+            ok, msg = rc_trigger_launch(lf)
+            if ok:
+                return [msg], None
+
+        return ["Valorant launch command sent to Riot Client"], None
 
     # Fallback to direct game exe if Riot Client not found
     game = find_game_exe()
     if game:
         try:
-            subprocess.Popen([game])
+            subprocess.Popen([game], cwd=os.path.dirname(game))
             return ["Valorant is starting (direct exe)..."], None
         except Exception as e:
             return None, "direct launch blocked: %s" % e
@@ -322,6 +355,7 @@ def launch():
 
 def kill_game():
     subprocess.run(["taskkill", "/F", "/IM", GAME_EXE], capture_output=True)
+    subprocess.run(["taskkill", "/F", "/IM", "VALORANT.exe"], capture_output=True)
     subprocess.run(["taskkill", "/F", "/IM", "RiotClientServices.exe"], capture_output=True)
 
 # ── RIOT LOCAL + GLZ API ─────────────────────────────────────────────
