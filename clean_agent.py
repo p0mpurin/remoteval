@@ -918,6 +918,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
                 pres = get_presence_state() if running else None
 
+                loading_stage = ""
                 if pres:
                     loop = pres.get("loop_state") or ""
                     party = pres.get("party_state") or ""
@@ -929,56 +930,73 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         since = "presence-INGAME"
                         line = "sessionLoopState=INGAME (5v5 Loading Screen / In Match)"
                         ready_to_play = False
+                        loading_stage = "In Match"
                     elif loop == "PREGAME":
                         state = "agent_select"
                         since = "presence-PREGAME"
                         line = "sessionLoopState=PREGAME (Agent Select)"
                         ready_to_play = False
+                        loading_stage = "Agent Select"
                     elif party == "MATCHMADE_GAME_STARTING":
                         state = "match_found"
                         since = "presence-MATCHMADE"
                         line = "partyState=MATCHMADE_GAME_STARTING (Match Found)"
                         ready_to_play = False
+                        loading_stage = "Match Found"
                     elif party == "MATCHMAKING":
                         state = "queued"
                         since = "presence-MATCHMAKING"
                         line = "partyState=MATCHMAKING (In Queue)"
                         ready_to_play = False
+                        loading_stage = "In Queue"
                     elif loop == "MENUS":
                         state = "menus"
                         since = "presence-MENUS"
                         line = "sessionLoopState=MENUS (Lobby)"
                         ready_to_play = True
+                        loading_stage = "Lobby Ready"
                     else:
-                        state = "menus"
-                        ready_to_play = True
-                else:
-                    # Fallback if presence not yet active
-                    fast_state, fast_line = get_fast_log_state()
-                    if fast_state in ("in_game", "agent_locked", "agent_select") and running:
-                        state = fast_state
-                        since = "log-fast"
-                        line = fast_line
-                    else:
-                        state, since, line = detect_state()
-                        if state in ("menus", "LOBBY"):
-                            ready_to_play = True
-                        elif ready_to_play and state in ("loading", "offline"):
-                            state = "menus"
+                        state = "loading"
+                        ready_to_play = False
+                        loading_stage = "Connecting to lobby..."
+                elif running:
+                    # Game process IS running, but presence has NOT confirmed MENUS yet!
+                    # The game is currently initializing engine, anti-cheat, or loading shaders.
+                    state = "loading"
+                    ready_to_play = False
+                    since = "loading"
+                    line = "Valorant is launching and loading assets..."
 
-                # Loading check
-                if state in ("menus", "LOBBY", "agent_select", "in_game", "queued", "match_found", "postgame", "agent_locked") or ready_to_play:
-                    is_loading = False
-                elif running and state == "loading":
-                    is_loading = True
+                    if not win["exists"]:
+                        loading_stage = "Bootstrapping Valorant..."
+                    else:
+                        lf = read_lockfile()
+                        if not lf:
+                            loading_stage = "Starting Riot services..."
+                        else:
+                            fast_st, fast_ln = get_fast_log_state()
+                            if "PlatformInitializer" in fast_ln or "Beginning platform" in fast_ln:
+                                loading_stage = "Initializing platform & anti-cheat..."
+                            elif "LogGameFlowStateManager" in fast_ln:
+                                loading_stage = "Connecting to matchmaking..."
+                            else:
+                                loading_stage = "Loading engine & shaders..."
                 else:
-                    is_loading = False
+                    state = "offline"
+                    ready_to_play = False
+                    since = "offline"
+                    line = "Game not running"
+                    loading_stage = "Offline"
+
+                # Loading check — strictly True while game is running until ready_to_play
+                is_loading = (running and not ready_to_play and state not in ("agent_select", "in_game", "queued", "match_found"))
 
                 self._send({
                     "ok": True,
                     "game": running,
                     "loading": is_loading,
-                    "ready_to_play": ready_to_play or (state == "menus"),
+                    "ready_to_play": ready_to_play,
+                    "loading_stage": loading_stage,
                     "launch_status": get_launch_status(),
                     "window": win,
                     "state": state,
