@@ -516,20 +516,28 @@ def party_id():
         return None, err
     return data.get("ID") or data.get("id"), None
 
-def start_queue(mode):
+def set_queue_mode(mode):
     pid, err = party_id()
     if err or not pid:
         return {"ok": False, "error": err or "no party"}
     data, err = glz("POST", "/parties/v1/parties/%s/queue" % pid, {"queueID": mode})
-    if err and "HTTP 400" in err:
-        return {"ok": False, "error": err, "party": pid}
     return {"ok": err is None, "party": pid, "queue": mode, "resp": data, "error": err}
+
+def start_queue(mode):
+    pid, err = party_id()
+    if err or not pid:
+        return {"ok": False, "error": err or "no party"}
+    # 1. Set the game mode / queue on the party
+    data1, err1 = glz("POST", "/parties/v1/parties/%s/queue" % pid, {"queueID": mode})
+    # 2. Enter the matchmaking queue
+    data2, err2 = glz("POST", "/parties/v1/parties/%s/matchmaking/join" % pid, {})
+    return {"ok": err2 is None, "party": pid, "queue": mode, "set_resp": data1, "join_resp": data2, "error": err2 or err1}
 
 def cancel_queue():
     pid, err = party_id()
     if err or not pid:
         return {"ok": False, "error": err or "no party"}
-    data, err = glz("DELETE", "/parties/v1/parties/%s/queue" % pid)
+    data, err = glz("POST", "/parties/v1/parties/%s/matchmaking/leave" % pid, {})
     return {"ok": err is None, "party": pid, "resp": data, "error": err}
 
 def pick_agent(name):
@@ -631,6 +639,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try: n = int(self.path.split("n=")[1].split("&")[0])
                 except Exception: pass
                 self._send({"ok": True, "lines": tail_lines(n)})
+            elif path == "/set_mode":
+                mode = "unrated"
+                try: mode = self.path.split("mode=")[1].split("&")[0]
+                except Exception: pass
+                if mode not in ("unrated", "competitive", "swiftplay", "spikerush", "deathmatch", "hurm", "custom"):
+                    self._send({"ok": False, "error": "bad mode"})
+                    return
+                self._send(set_queue_mode(mode))
             elif path == "/queue":
                 mode = "unrated"
                 try: mode = self.path.split("mode=")[1].split("&")[0]
