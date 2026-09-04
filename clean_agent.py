@@ -802,6 +802,91 @@ def pick_agent(name):
     return {"ok": err1 is None and err2 is None, "match": mid, "agent": name,
             "select_err": err1, "lock_err": err2}
 
+def get_presence_state():
+    """
+    Directly query local Riot Client /chat/v4/presences.
+    Decodes the 'private' base64 payload to read exact in-memory game state:
+      - sessionLoopState: 'MENUS' (lobby), 'PREGAME' (agent select), 'INGAME' (5v5 screen / match)
+      - partyState: 'DEFAULT', 'MATCHMAKING' (in queue), 'MATCHMADE_GAME_STARTING' (match found)
+      - queueEntryTime: exact queue start timestamp
+      - matchMap: current map
+    Returns dict or None.
+    """
+    try:
+        data, err = local_api("/chat/v4/presences")
+        if err or not data or "presences" not in data:
+            return None
+        
+        puuid, _ = get_puuid()
+        for p in data.get("presences", []):
+            prod = (p.get("product") or "").lower()
+            p_puuid = p.get("puuid")
+            
+            # Match our player or product valorant
+            if puuid and p_puuid and p_puuid != puuid:
+                continue
+            if not puuid and prod != "valorant":
+                continue
+            
+            priv_b64 = p.get("private")
+            if not priv_b64:
+                continue
+            
+            try:
+                rem = len(priv_b64) % 4
+                if rem > 0:
+                    priv_b64 += "=" * (4 - rem)
+                raw = base64.b64decode(priv_b64)
+                priv = json.loads(raw.decode("utf-8", "replace"))
+            except Exception:
+                try:
+                    raw = base64.urlsafe_b64decode(priv_b64)
+                    priv = json.loads(raw.decode("utf-8", "replace"))
+                except Exception:
+                    continue
+            
+            if not isinstance(priv, dict):
+                continue
+            
+            loop_state = priv.get("sessionLoopState")  # MENUS, PREGAME, INGAME
+            party_state = priv.get("partyState")        # DEFAULT, MATCHMAKING, MATCHMADE_GAME_STARTING
+            
+            if not loop_state and not party_state:
+                continue
+            
+            # Map
+            map_path = priv.get("matchMap") or priv.get("partyOwnerMatchMap") or ""
+            map_name = resolve_map_name(map_path) if map_path else "Unknown"
+            
+            # Queue elapsed seconds
+            queue_elapsed = -1
+            qet = priv.get("queueEntryTime") or ""
+            if not qet and isinstance(priv.get("matchmakingData"), dict):
+                qet = priv["matchmakingData"].get("queueEntryTime") or ""
+            if not qet and isinstance(priv.get("partyData"), dict):
+                qet = priv["partyData"].get("queueEntryTime") or ""
+                
+            if qet and qet != "0001-01-01T00:00:00Z":
+                import datetime
+                try:
+                    qet_clean = qet.split(".")[0].rstrip("Z")
+                    qt = datetime.datetime.strptime(qet_clean, "%Y-%m-%dT%H:%M:%S")
+                    now = datetime.datetime.utcnow()
+                    queue_elapsed = max(0, int((now - qt).total_seconds()))
+                except Exception:
+                    pass
+            
+            return {
+                "loop_state": loop_state,
+                "party_state": party_state,
+                "queue_elapsed": queue_elapsed,
+                "map_name": map_name,
+                "queue_id": priv.get("queueId"),
+            }
+    except Exception:
+        pass
+    return None
+
 # ── HTTP REQUEST HANDLER ─────────────────────────────────────────────
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -811,8 +896,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = json.dumps(obj).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(data)
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
@@ -828,96 +913,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 running = game_running() or win["exists"]
 
                 map_name = "Unknown"
-                pregame_mid = None
-                coregame_mid = None
                 ready_to_play = False
-                queue_elapsed_secs = -1  # -1 = not in queue
+                queue_elapsed_secs = -1
 
-                puuid, _ = get_puuid() if running else (None, None)
+                pres = get_presence_state() if running else None
 
-                if running and puuid:
-                    # ── Party / queue state ────────────────────────────────
-                    try:
-                        pid, perr = party_id()
-                        if pid:
-                            ready_to_play = True
-                            # Get actual queue start time from party MatchmakingData
-                            pdata, _ = glz("GET", "/parties/v1/parties/%s" % pid)
-                            if pdata:
-                                mm = pdata.get("MatchmakingData") or {}
-                                qet = mm.get("QueueEntryTime", "")  # ISO timestamp
-                                if qet and qet != "0001-01-01T00:00:00Z":
-                                    import datetime
-                                    try:
-                                        # Parse ISO 8601 and compute elapsed seconds
-                                        qet_clean = qet.split(".")[0].rstrip("Z")
-                                        qt = datetime.datetime.strptime(qet_clean, "%Y-%m-%dT%H:%M:%S")
-                                        now = datetime.datetime.utcnow()
-                                        queue_elapsed_secs = max(0, int((now - qt).total_seconds()))
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        pass
+                if pres:
+                    loop = pres.get("loop_state") or ""
+                    party = pres.get("party_state") or ""
+                    map_name = pres.get("map_name") or "Unknown"
+                    queue_elapsed_secs = pres.get("queue_elapsed", -1)
 
-                    # ── Pregame (agent select) ─────────────────────────────
-                    try:
-                        p_pre, _ = glz("GET", "/pregame/v1/players/%s" % puuid)
-                        if p_pre and (p_pre.get("MatchID") or p_pre.get("matchId")):
-                            pregame_mid = p_pre.get("MatchID") or p_pre.get("matchId")
-                            match_data, _ = glz("GET", "/pregame/v1/matches/%s" % pregame_mid)
-                            if match_data:
-                                map_name = resolve_map_name(match_data.get("MapID", ""))
-                    except Exception:
-                        pass
-
-                    # ── Coregame (in active match / 5v5 screen) ────────────
-                    if not pregame_mid:
-                        try:
-                            cg, _ = glz("GET", "/core-game/v1/players/%s" % puuid)
-                            if cg and (cg.get("MatchID") or cg.get("matchId")):
-                                coregame_mid = cg.get("MatchID") or cg.get("matchId")
-                                cg_data, _ = glz("GET", "/core-game/v1/matches/%s" % coregame_mid)
-                                if cg_data:
-                                    map_name = resolve_map_name(cg_data.get("MapID", ""))
-                        except Exception:
-                            pass
-
-                # ── Determine authoritative state ──────────────────────────
-                fast_state, fast_line = get_fast_log_state()
-
-                if pregame_mid:
-                    state = "agent_select"
-                    since = "live-pregame"
-                    line = "Pregame match: " + str(pregame_mid)
-                elif coregame_mid:
-                    state = "in_game"
-                    since = "live-coregame"
-                    line = "Coregame match: " + str(coregame_mid)
-                    ready_to_play = False
-                elif fast_state == "agent_locked" and running:
-                    # Pregame_LockCharacter fired — agent just locked, map loading imminent
-                    state = "agent_locked"
-                    since = "log-fast"
-                    line = fast_line
-                    ready_to_play = False
-                elif fast_state == "in_game" and running:
-                    state = "in_game"
-                    since = "log-fast"
-                    line = fast_line
-                    ready_to_play = False
-                elif fast_state == "agent_select" and running:
-                    state = "agent_select"
-                    since = "log-fast"
-                    line = fast_line
-                else:
-                    state, since, line = detect_state()
-                    if state in ("menus", "LOBBY"):
-                        ready_to_play = True
-                    elif ready_to_play and state in ("loading", "offline"):
+                    if loop == "INGAME":
+                        state = "in_game"
+                        since = "presence-INGAME"
+                        line = "sessionLoopState=INGAME (5v5 Loading Screen / In Match)"
+                        ready_to_play = False
+                    elif loop == "PREGAME":
+                        state = "agent_select"
+                        since = "presence-PREGAME"
+                        line = "sessionLoopState=PREGAME (Agent Select)"
+                        ready_to_play = False
+                    elif party == "MATCHMADE_GAME_STARTING":
+                        state = "match_found"
+                        since = "presence-MATCHMADE"
+                        line = "partyState=MATCHMADE_GAME_STARTING (Match Found)"
+                        ready_to_play = False
+                    elif party == "MATCHMAKING":
+                        state = "queued"
+                        since = "presence-MATCHMAKING"
+                        line = "partyState=MATCHMAKING (In Queue)"
+                        ready_to_play = False
+                    elif loop == "MENUS":
                         state = "menus"
+                        since = "presence-MENUS"
+                        line = "sessionLoopState=MENUS (Lobby)"
+                        ready_to_play = True
+                    else:
+                        state = "menus"
+                        ready_to_play = True
+                else:
+                    # Fallback if presence not yet active
+                    fast_state, fast_line = get_fast_log_state()
+                    if fast_state in ("in_game", "agent_locked", "agent_select") and running:
+                        state = fast_state
+                        since = "log-fast"
+                        line = fast_line
+                    else:
+                        state, since, line = detect_state()
+                        if state in ("menus", "LOBBY"):
+                            ready_to_play = True
+                        elif ready_to_play and state in ("loading", "offline"):
+                            state = "menus"
 
-                # Loading only if game is running and truly loading
-                if state in ("menus", "LOBBY", "agent_select", "in_game", "queued", "match_found", "postgame") or ready_to_play:
+                # Loading check
+                if state in ("menus", "LOBBY", "agent_select", "in_game", "queued", "match_found", "postgame", "agent_locked") or ready_to_play:
                     is_loading = False
                 elif running and state == "loading":
                     is_loading = True
@@ -935,8 +985,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "state_since": since,
                     "last_state_line": line,
                     "map": map_name,
-                    "pregame_id": pregame_mid,
-                    "coregame_id": coregame_mid,
                     "queue_elapsed_secs": queue_elapsed_secs,
                 })
             elif path == "/window/focus":
