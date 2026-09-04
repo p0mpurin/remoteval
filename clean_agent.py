@@ -366,10 +366,24 @@ _CTX.verify_mode = ssl.CERT_NONE
 
 def read_lockfile():
     try:
+        if not os.path.exists(LOCKFILE):
+            return None
         with open(LOCKFILE, "r") as f:
             parts = f.read().strip().split(":")
         if len(parts) >= 5:
-            return {"port": int(parts[1]), "password": parts[3], "protocol": parts[4]}
+            pid = int(parts[1])
+            port = int(parts[2])
+            password = parts[3]
+            protocol = parts[4]
+            # Verify process is still alive so we don't connect to a dead port
+            try:
+                h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+                if not h:
+                    return None
+                ctypes.windll.kernel32.CloseHandle(h)
+            except Exception:
+                pass
+            return {"name": parts[0], "pid": pid, "port": port, "password": password, "protocol": protocol}
     except Exception:
         pass
     return None
