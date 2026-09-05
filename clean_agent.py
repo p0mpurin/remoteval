@@ -1538,7 +1538,18 @@ class StateStore:
                     row["name"] = identity.get("name") or ("You" if row.get("self") else "Teammate %d" % (row.get("slot", 0)+1))
                     row["tag"] = identity.get("tag") or ""
                     allies.append(row)
-            return {"ok": True, "instance_id": self.instance, "generation": self.generation,
+            party = {"available": False}
+            party_entry = self.sources.get("party_roster")
+            if self.identity and party_entry and now-party_entry[0] <= 8.:
+                party = copy.deepcopy(party_entry[1])
+                names = names_entry[1] if names_entry and current("names") else {}
+                for row in party.get("members", []):
+                    subject = row.pop("subject", "")
+                    identity = names.get(subject, {}) if not row.pop("hidden", False) else {}
+                    row["name"] = identity.get("name") or ("You" if row["self"] else "Party member")
+                    row["tag"] = identity.get("tag", "")
+                party["age_ms"] = round((now-party_entry[0])*1000)
+            return {"ok": True, "party": party, "instance_id": self.instance, "generation": self.generation,
                     "sequence": self.seq, "state": self.state.lower(),
                     "phase": self.state, "state_since": self.since,
                     "game": bool(self.identity), "loading": self.state == "LOADING",
@@ -1563,6 +1574,118 @@ class StateStore:
                     "errors": dict(self.errors)}
 
 
+
+def sanitize_party(data, who):
+    """Live social data only; no credentials, hidden identity, or disk cache."""
+    if not isinstance(data, dict) or not isinstance(data.get("ID"), str):
+        return {"available": False}
+    members = []
+    rows = data.get("Members")
+    if not isinstance(rows, list):
+        return {"available": False}
+    for row in rows[:20]:
+        if not isinstance(row, dict) or not isinstance(row.get("Subject"), str):
+            continue
+        identity = row.get("PlayerIdentity")
+        identity = identity if isinstance(identity, dict) else {}
+        members.append({"subject": row["Subject"], "self": row["Subject"] == who,
+                        "leader": row.get("IsOwner") is True,
+                        "ready": row.get("IsReady") is True,
+                        "hidden": identity.get("Incognito") is True})
+    if not any(row["self"] for row in members):
+        return {"available": False}
+    def strings(key):
+        values = data.get(key)
+        return [v[:96] for v in values[:32] if isinstance(v, str)] if isinstance(values, list) else []
+    matchmaking = data.get("MatchmakingData")
+    matchmaking = matchmaking if isinstance(matchmaking, dict) else {}
+    return {"available": True, "id": data["ID"], "account_id": who,
+            "state": str(data.get("State") or "UNKNOWN")[:48],
+            "accessibility": str(data.get("Accessibility") or "UNKNOWN")[:16],
+            "queue": str(matchmaking.get("QueueID") or "")[:48],
+            "leader": any(row["self"] and row["leader"] for row in members),
+            "members": members, "eligible_queues": strings("EligibleQueues"),
+            "restrictions": strings("QueueIneligibilities"),
+            "code": str(data.get("InviteCode") or "")[:32]}
+
+
+def party_action(payload):
+    """User-initiated commands, bound to the displayed game/account/party."""
+    if not isinstance(payload, dict) or detector is None:
+        return {"ok": False, "error": "Party unavailable"}
+    if not detector.party_action_lock.acquire(blocking=False):
+        return {"ok": False, "error": "A party action is already running"}
+    try:
+        snap = detector.store.snapshot()
+        party = snap.get("party", {})
+        if (snap["phase"] != "MENUS" or snap["degraded"] or not party.get("available") or
+                any(payload.get(key) != value for key, value in
+                    (("instance", snap["instance_id"]), ("generation", snap["generation"]),
+                     ("party_id", party.get("id")), ("account_id", party.get("account_id"))))):
+            return {"ok": False, "error": "Lobby changed. Wait for the party to refresh."}
+        with detector.auth_lock:
+            auth = detector.auth
+        if not auth or auth[0] != party["account_id"] or auth[3] <= time.time():
+            return {"ok": False, "error": "Account changed. Refresh the lobby."}
+        def call(method, path, body=None):
+            # Pin all requests to the same authentication snapshot.
+            with detector.auth_lock:
+                if detector.auth is not auth or time.monotonic() < detector.remote_pause_until:
+                    raise ValueError("Authentication changed or rate limit cooldown active")
+            base = f"https://glz-{detector.config.region}-1.{detector.config.shard}.a.pvp.net"
+            with _HttpSession() as session:
+                response = session.request(method, base+path, headers=auth[1], body=body, timeout=(1., 2.))
+                if response.status_code == 401:
+                    detector.refresh.set()
+                if response.status_code == 429:
+                    with detector.auth_lock:
+                        detector.remote_pause_until = max(detector.remote_pause_until,
+                            time.monotonic()+detector._retry_after(response.headers.get("Retry-After")))
+                response.raise_for_status()
+                return response.json() if response.body else {}
+        quote = lambda value: urllib.parse.quote(value, safe="")
+        player_path = "/parties/v1/players/"+quote(auth[0])
+        current = call("GET", player_path)
+        if current.get("CurrentPartyID") != party["id"]:
+            return {"ok": False, "error": "Party changed. Try again after it refreshes."}
+        path = "/parties/v1/parties/"+quote(party["id"])
+        latest = sanitize_party(call("GET", path), auth[0])
+        if not latest.get("available") or latest.get("state") != "DEFAULT":
+            return {"ok": False, "error": "Party is no longer resting in the lobby."}
+        action = payload.get("action")
+        if action == "invite":
+            name, tag = payload.get("name", ""), payload.get("tag", "")
+            if (not isinstance(name, str) or not isinstance(tag, str) or not 1 <= len(name) <= 32 or
+                    not 1 <= len(tag) <= 8 or any(ord(c) < 32 for c in name+tag)):
+                return {"ok": False, "error": "Enter a valid Riot name and tag."}
+            method, target = "POST", path+"/invites/name/"+quote(name)+"/tag/"+quote(tag)
+        elif action == "join_code":
+            code = payload.get("code", "")
+            if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9-]{3,32}", code):
+                return {"ok": False, "error": "Enter a valid party code."}
+            method, target = "POST", "/parties/v1/players/joinbycode/"+quote(code)
+        elif action in ("generate_code", "disable_code"):
+            if not latest.get("leader"):
+                return {"ok": False, "error": "Only the party leader can manage the code."}
+            method, target = ("POST" if action == "generate_code" else "DELETE"), path+"/invitecode"
+        elif action == "leave":
+            method, target = "DELETE", player_path
+        else:
+            return {"ok": False, "error": "Unknown party action"}
+        check = detector.store.snapshot()
+        if check["generation"] != snap["generation"] or check["phase"] != "MENUS" or check["degraded"]:
+            return {"ok": False, "error": "Game state changed. Action skipped."}
+        call(method, target, {} if method == "POST" else None)
+        # Hide the old party until the existing worker confirms the new state.
+        detector.store.observe("party_roster", {"available": False}, snap["generation"])
+        detector.remote_wake["party"].set()
+        return {"ok": True, "message": "Party action accepted. Refreshing lobby."}
+    except (_NetworkError, ValueError, KeyError, TypeError):
+        return {"ok": False, "error": "Riot did not confirm the party action. Check the client before retrying."}
+    finally:
+        detector.party_action_lock.release()
+
+
 class Detector:
     def __init__(self, config):
         self.config = config
@@ -1570,6 +1693,7 @@ class Detector:
         self.stop_event = threading.Event()
         self.threads = []
         self.auth_lock = threading.Lock()
+        self.party_action_lock = threading.Lock()
         self.auth = None
         self.window_cache = {"exists": False}
         self.refresh = threading.Event()
@@ -1903,6 +2027,8 @@ class Detector:
                             value = data[key]
                             if not isinstance(value, str) or not value:
                                 raise ValueError("missing_id")
+                    if kind == "party" and not value:
+                        self.store.observe("party_roster", {"available": False}, generation, began)
                     if kind == "party" and value:
                         with session.get(base+f"/parties/v1/parties/{value}", headers=headers,
                                          timeout=(.5,.7)) as r:
@@ -1914,6 +2040,12 @@ class Detector:
                                         time.monotonic()+self._retry_after(r.headers.get("Retry-After")))
                             r.raise_for_status()
                             party_response = r.json()
+                            roster = sanitize_party(party_response, who)
+                            roster["pending_requests"] = len(data.get("Requests") or [])
+                            with self.auth_lock:
+                                same_account = self.auth is auth
+                            if same_account:
+                                self.store.observe("party_roster", roster, generation, began)
                             value = dict(party_response.get("MatchmakingData") or {})
                             value["State"] = party_response.get("State")
                     elif kind == "pregame" and value:
@@ -1986,6 +2118,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass
         except Exception as e:
             pass
+
+    def do_POST(self):
+        if self.path != "/party/action":
+            self._send({"ok": False, "error": "Unknown endpoint"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if self.headers.get("Origin") or not 0 < length <= 4096 or self.headers.get_content_type() != "application/json":
+                raise ValueError("Invalid party request")
+            self._send(party_action(json.loads(self.rfile.read(length))))
+        except (ValueError, TypeError):
+            self._send({"ok": False, "error": "Invalid party request"})
 
     def do_GET(self):
         path = self.path.split("?")[0]
