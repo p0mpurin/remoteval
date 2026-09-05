@@ -2,7 +2,7 @@ import datetime as dt
 import unittest
 from unittest.mock import patch
 
-from clean_agent import StateStore, timestamp, Detector
+from clean_agent import StateStore, timestamp, Detector, AGENTS, sanitize_pregame_roster
 
 
 class DetectorTests(unittest.TestCase):
@@ -120,6 +120,30 @@ class DetectorTests(unittest.TestCase):
         self.presence(party='MATCHMADE_GAME_STARTING')
         self.assertEqual(self.s.snapshot()['phase'], 'AGENT_SELECT')
         self.assertIsNone(self.s.snapshot()['pregame_id'])
+
+    def test_pregame_roster_is_sanitized_and_named(self):
+        payload = {"AllyTeam": {"Players": [
+            {"Subject": "me", "CharacterID": AGENTS["Jett"],
+             "CharacterSelectionState": "locked"},
+            {"Subject": "ally", "CharacterID": AGENTS["Sage"],
+             "CharacterSelectionState": "selected"},
+            {"Subject": "waiting", "CharacterID": "",
+             "CharacterSelectionState": ""},
+        ]}}
+        roster = sanitize_pregame_roster(payload, "me")
+        self.assertEqual([p["state"] for p in roster], ["LOCKED", "HOVERING", "CHOOSING"])
+        self.assertTrue(roster[0]["self"])
+        self.put("pregame", "match-1")
+        self.put("pregame_roster", {"match_id": "match-1", "players": roster})
+        self.put("names", {"me": {"name": "Player", "tag": "EUW"},
+                           "ally": {"name": "Teammate", "tag": "123"}})
+        allies = self.s.snapshot()["allies"]
+        self.assertEqual(allies[0]["name"], "Player")
+        self.assertEqual(allies[1]["agent"], "Sage")
+        self.assertEqual(allies[2]["name"], "Teammate 3")
+        self.assertNotIn("subject", allies[0])
+        self.put("pregame", "match-2")
+        self.assertEqual(self.s.snapshot()["allies"], [])
 
     def test_request_order_and_old_absence(self):
         self.put('core', 'new', started=100)

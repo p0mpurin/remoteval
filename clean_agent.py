@@ -194,6 +194,35 @@ AGENTS = {
     "Veto": "17743d5b-486a-4934-8b6b-4e897e685f4e",
     "Miks": "87e35b71-419b-449e-b7d8-a92c0a969b8b",
 }
+AGENT_NAMES_BY_ID = {agent_id.lower(): name for name, agent_id in AGENTS.items()}
+
+def sanitize_pregame_roster(payload, self_subject):
+    """Reduce Riot's pregame match response to the five ally slots the UI needs."""
+    if not isinstance(payload, dict):
+        return []
+    ally = payload.get("AllyTeam") or {}
+    players = ally.get("Players") if isinstance(ally, dict) else None
+    if not isinstance(players, list):
+        return []
+    result = []
+    for slot, player in enumerate(players[:5]):
+        if not isinstance(player, dict):
+            continue
+        subject = player.get("Subject")
+        character_id = player.get("CharacterID") or ""
+        selection = str(player.get("CharacterSelectionState") or "").lower()
+        locked = "lock" in selection
+        state = "LOCKED" if locked else "HOVERING" if character_id else "CHOOSING"
+        result.append({
+            "slot": slot,
+            "subject": subject if isinstance(subject, str) else "",
+            "self": bool(subject and subject == self_subject),
+            "agent_id": character_id if isinstance(character_id, str) else "",
+            "agent": AGENT_NAMES_BY_ID.get(str(character_id).lower(), ""),
+            "state": state,
+            "locked": locked,
+        })
+    return result
 
 def find_game_exe():
     for p in GAME_EXE_PATHS:
@@ -1494,6 +1523,19 @@ class StateStore:
             elapsed = None
             if self.queue_anchor and not self.degraded:
                 elapsed = self.queue_anchor[2] + now - self.queue_anchor[1]
+            allies = []
+            roster_entry = self.sources.get("pregame_roster")
+            names_entry = self.sources.get("names")
+            current_pregame = self.sources.get("pregame", (0, None))[1] if current("pregame") else None
+            if (self.state == "AGENT_SELECT" and roster_entry and current("pregame_roster") and
+                    isinstance(roster_entry[1], dict) and roster_entry[1].get("match_id") == current_pregame):
+                names = names_entry[1] if names_entry and current("names") and isinstance(names_entry[1], dict) else {}
+                for player in roster_entry[1].get("players", []):
+                    row = dict(player)
+                    identity = names.get(row.pop("subject", ""), {})
+                    row["name"] = identity.get("name") or ("You" if row.get("self") else "Teammate %d" % (row.get("slot", 0)+1))
+                    row["tag"] = identity.get("tag") or ""
+                    allies.append(row)
             return {"ok": True, "instance_id": self.instance, "generation": self.generation,
                     "sequence": self.seq, "state": self.state.lower(),
                     "phase": self.state, "state_since": self.since,
@@ -1514,6 +1556,7 @@ class StateStore:
                     "sampled_at": time.time(), "alert": copy.deepcopy(self.alert),
                     "pregame_id": (self.sources.get("pregame", (0, None))[1]
                                    if self.state == "AGENT_SELECT" else None),
+                    "allies": allies,
                     "source_age_ms": {k: round((now-v[0])*1000) for k,v in self.sources.items()},
                     "errors": dict(self.errors)}
 
@@ -1718,6 +1761,17 @@ class Detector:
                             r.raise_for_status()
                             data = r.json()
                         rows = data.get("presences", []) if isinstance(data, dict) else data
+                        names = {}
+                        for presence in rows if isinstance(rows, list) else []:
+                            if not isinstance(presence, dict) or presence.get("product") != "valorant":
+                                continue
+                            player_id = presence.get("puuid")
+                            if not isinstance(player_id, str) or not player_id:
+                                continue
+                            game_name = presence.get("game_name") or presence.get("gameName") or presence.get("name") or ""
+                            game_tag = presence.get("game_tag") or presence.get("gameTag") or ""
+                            names[player_id] = {"name": str(game_name)[:32], "tag": str(game_tag)[:8]}
+                        self.store.observe("names", names, generation, started)
                         own = next((p for p in rows if p.get("puuid") == subject and
                                     p.get("product") == "valorant"), None)
                         if own:
@@ -1786,6 +1840,22 @@ class Detector:
                             party_response = r.json()
                             value = dict(party_response.get("MatchmakingData") or {})
                             value["State"] = party_response.get("State")
+                    elif kind == "pregame" and value:
+                        try:
+                            with session.get(base+f"/pregame/v1/matches/{value}", headers=headers,
+                                             timeout=(.5,.7)) as r:
+                                if r.status_code == 401:
+                                    self.refresh.set()
+                                if r.status_code == 429:
+                                    with self.auth_lock:
+                                        self.remote_pause_until = max(self.remote_pause_until,
+                                            time.monotonic()+self._retry_after(r.headers.get("Retry-After")))
+                                r.raise_for_status()
+                                roster = {"match_id": value,
+                                          "players": sanitize_pregame_roster(r.json(), who)}
+                            self.store.observe("pregame_roster", roster, generation, began)
+                        except (_NetworkError, ValueError, KeyError, TypeError):
+                            self.store.error("pregame_roster", "roster_unavailable")
                     with self.auth_lock:
                         current_auth = self.auth
                     if current_auth is auth:

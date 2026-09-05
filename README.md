@@ -131,7 +131,7 @@ Run the offline tests with `py -m unittest discover -p "test_*.py" -v`.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/status` | Cached process/window state, phase, freshness, queue duration, and retained transition alert |
+| `GET` | `/status` | Cached process/window state, phase, freshness, queue duration, transition alert, and live ally picks during Agent Select |
 | `GET` | `/window/focus` | Restores the VALORANT window from minimized state and brings it to foreground |
 | `GET` | `/queue?mode=<mode>` | Starts matchmaking queue (`unrated`, `competitive`, `swiftplay`, etc.) |
 | `GET` | `/cancel` | Cancels current matchmaking queue |
