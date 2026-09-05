@@ -1415,7 +1415,7 @@ class StateStore:
             self.sources[source] = (started, data)
             self.errors.pop(source, None)
             if source == "presence":
-                if data.get("sessionLoopState") == "MENUS" and data.get("partyState") == "DEFAULT":
+                if data.get("sessionLoopState") == "MENUS" and data.get("partyState") not in ("MATCHMAKING", "MATCHMADE_GAME_STARTING"):
                     self.menu_samples = min(2, self.menu_samples + 1) if old and now-old[0] <= self.freshness else 1
                 else:
                     self.menu_samples = 0
@@ -1467,7 +1467,7 @@ class StateStore:
             candidate, source = "AGENT_SELECT", "presence_match_found"
         elif (loop == "MENUS" and party == "MATCHMAKING") or party_data.get("State") == "MATCHMAKING":
             candidate, source = "QUEUED", "presence" if party == "MATCHMAKING" else "party"
-        elif loop == "MENUS" and (party in ("DEFAULT", None, "") or self.menu_samples >= 1 or self.presence_changed or now-self.lobby_verified_at <= .5):
+        elif loop == "MENUS" and party not in ("MATCHMAKING", "MATCHMADE_GAME_STARTING"):
             candidate, source = "MENUS", "presence"
         elif (now-self.lobby_verified_at <= .5 and
               all(k in fresh and fresh[k][1] is None for k in ("core", "pregame")) and
@@ -1525,10 +1525,9 @@ class StateStore:
                 entry = self.sources.get(key)
                 return entry is not None and now-entry[0] <= self.freshness
             presence = self.sources.get("presence", (0, {}))[1] or {}
-            api_ready = (self.menu_samples >= 2 and current("presence") and
-                         presence.get("sessionLoopState") == "MENUS" and presence.get("partyState") == "DEFAULT" and
-                         current("window") and self.sources["window"][1].get("exists", False) and
-                         all(current(k) and self.sources[k][1] is None for k in ("core", "pregame")))
+            api_ready = (current("presence") and
+                         presence.get("sessionLoopState") == "MENUS" and
+                         presence.get("partyState") not in ("MATCHMAKING", "MATCHMADE_GAME_STARTING"))
             ready = self.state == "MENUS" and self.state_confirmed and (api_ready or visual) and not self.degraded
             elapsed = None
             if self.queue_anchor and not self.degraded:
@@ -1942,31 +1941,43 @@ class Detector:
                     url = f"{protocol}://127.0.0.1:{int(port)}"
                     session.auth = ("riot", password)
                     generation = self.store.generation
+                    if not subject:
+                        try:
+                            with session.get(url+"/chat/v1/session", verify=False, timeout=(1.0, 2.0)) as r:
+                                if r.status_code == 200:
+                                    sdata = r.json()
+                                    if isinstance(sdata, dict) and sdata.get("puuid"):
+                                        subject = sdata["puuid"]
+                        except (OSError, ValueError, KeyError, TypeError, _NetworkError):
+                            pass
                     with self.auth_lock:
                         auth = self.auth
                     if started >= retry_at and (not auth or auth[3] < time.time()+60 or self.refresh.is_set()):
                         retry_at = started + 5  # coalesce concurrent 401s
                         self.refresh.clear()
-                        with session.get(url+"/entitlements/v1/token", verify=False, timeout=(.3,.4)) as r:
-                            r.raise_for_status()
-                            tokens = r.json()
-                        who = tokens["subject"]
-                        if subject is not None and who != subject:
-                            self.store.invalidate_session()
-                            generation = self.store.generation
-                        subject = who
-                        headers = {"Authorization": "Bearer "+tokens["accessToken"],
-                                   "X-Riot-Entitlements-JWT": tokens["token"],
-                                   "X-Riot-ClientVersion": self.config.client_version,
-                                   "X-Riot-ClientPlatform": base64.b64encode(json.dumps({
-                                       "platformType":"PC", "platformOS":"Windows",
-                                       "platformOSVersion":"10.0.19045.1.256.64bit",
-                                       "platformChipset":"Unknown"}).encode()).decode()}
-                        with self.auth_lock:
-                            self.auth = (who, headers, generation,
-                                         min(jwt_exp(tokens["accessToken"]), jwt_exp(tokens["token"])))
+                        try:
+                            with session.get(url+"/entitlements/v1/token", verify=False, timeout=(1.5, 3.0)) as r:
+                                r.raise_for_status()
+                                tokens = r.json()
+                            who = tokens["subject"]
+                            if subject is not None and who != subject:
+                                self.store.invalidate_session()
+                                generation = self.store.generation
+                            subject = who
+                            headers = {"Authorization": "Bearer "+tokens["accessToken"],
+                                       "X-Riot-Entitlements-JWT": tokens["token"],
+                                       "X-Riot-ClientVersion": self.config.client_version,
+                                       "X-Riot-ClientPlatform": base64.b64encode(json.dumps({
+                                           "platformType":"PC", "platformOS":"Windows",
+                                           "platformOSVersion":"10.0.19045.1.256.64bit",
+                                           "platformChipset":"Unknown"}).encode()).decode()}
+                            with self.auth_lock:
+                                self.auth = (who, headers, generation,
+                                             min(jwt_exp(tokens["accessToken"]), jwt_exp(tokens["token"])))
+                        except (OSError, ValueError, KeyError, TypeError, _NetworkError):
+                            self.store.error("auth", "entitlements_token_request_failed")
                     if subject:
-                        with session.get(url+"/chat/v4/presences", verify=False, timeout=(.3,.4)) as r:
+                        with session.get(url+"/chat/v4/presences", verify=False, timeout=(1.5, 3.0)) as r:
                             r.raise_for_status()
                             data = r.json()
                         rows = data.get("presences", []) if isinstance(data, dict) else data
@@ -2019,7 +2030,7 @@ class Detector:
                 prefix = {"core":"core-game", "pregame":"pregame", "party":"parties"}[kind]
                 path = f"/{prefix}/v1/players/{who}"
                 try:
-                    with session.get(base+path, headers=headers, timeout=(.5,.7)) as r:
+                    with session.get(base+path, headers=headers, timeout=(1.5, 3.0)) as r:
                         if r.status_code == 429:
                             delay = self._retry_after(r.headers.get("Retry-After"))
                             with self.auth_lock:
@@ -2040,7 +2051,7 @@ class Detector:
                         self.store.observe("party_roster", {"available": False}, generation, began)
                     if kind == "party" and value:
                         with session.get(base+f"/parties/v1/parties/{value}", headers=headers,
-                                         timeout=(.5,.7)) as r:
+                                         timeout=(1.5, 3.0)) as r:
                             if r.status_code == 401:
                                 self.refresh.set()
                             if r.status_code == 429:
@@ -2060,7 +2071,7 @@ class Detector:
                     elif kind == "pregame" and value:
                         try:
                             with session.get(base+f"/pregame/v1/matches/{value}", headers=headers,
-                                             timeout=(.5,.7)) as r:
+                                             timeout=(1.5, 3.0)) as r:
                                 if r.status_code == 401:
                                     self.refresh.set()
                                 if r.status_code == 429:
