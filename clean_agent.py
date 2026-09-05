@@ -1042,15 +1042,18 @@ def _shipping_processes():
             if entry.szExeFile.lower() == "valorant-win64-shipping.exe":
                 handle = kernel.OpenProcess(0x1000, False, entry.th32ProcessID)
                 if not handle:
-                    raise OSError("cannot inspect game process identity")
-                try:
-                    times = [wintypes.FILETIME() for _ in range(4)]
-                    if not kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
-                        raise OSError("cannot read game creation time")
-                    created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
-                    matches.append((entry.th32ProcessID, created))
-                finally:
-                    kernel.CloseHandle(handle)
+                    # Non-admin or access denied: still track the PID with 0 creation timestamp
+                    matches.append((entry.th32ProcessID, 0))
+                else:
+                    try:
+                        times = [wintypes.FILETIME() for _ in range(4)]
+                        if not kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                            created = 0
+                        else:
+                            created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+                        matches.append((entry.th32ProcessID, created))
+                    finally:
+                        kernel.CloseHandle(handle)
             found = kernel.Process32NextW(snapshot, ctypes.byref(entry))
         if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
             raise OSError("process enumeration incomplete")
@@ -1338,7 +1341,7 @@ class Config:
     local_interval: float = .20
     transition_interval: float = .50
     idle_interval: float = 1.0
-    freshness: float = 2.5
+    freshness: float = 6.0
 
     def __post_init__(self):
         if not all(re.fullmatch(r"[a-z0-9]+", x) for x in (self.region, self.shard)):
@@ -1349,7 +1352,7 @@ class Config:
 
 class StateStore:
     """All reducer operations are short and performed under one lock."""
-    def __init__(self, freshness=2.5):
+    def __init__(self, freshness=6.0):
         self.lock = threading.RLock()
         self.freshness = freshness
         self.instance = str(uuid.uuid4())
@@ -1369,6 +1372,10 @@ class StateStore:
         self.presence_changed = False
         self.menu_samples = 0
         self.lobby_verified_at = 0.
+
+    def touch_process(self):
+        with self.lock:
+            self.process_at = time.monotonic()
 
     def process(self, identity):
         with self.lock:
@@ -1460,7 +1467,7 @@ class StateStore:
             candidate, source = "AGENT_SELECT", "presence_match_found"
         elif (loop == "MENUS" and party == "MATCHMAKING") or party_data.get("State") == "MATCHMAKING":
             candidate, source = "QUEUED", "presence" if party == "MATCHMAKING" else "party"
-        elif loop == "MENUS" and party == "DEFAULT" and (self.menu_samples >= 2 or self.presence_changed or now-self.lobby_verified_at <= .5):
+        elif loop == "MENUS" and (party in ("DEFAULT", None, "") or self.menu_samples >= 1 or self.presence_changed or now-self.lobby_verified_at <= .5):
             candidate, source = "MENUS", "presence"
         elif (now-self.lobby_verified_at <= .5 and
               all(k in fresh and fresh[k][1] is None for k in ("core", "pregame")) and
@@ -1501,10 +1508,11 @@ class StateStore:
             evidence = fresh.get("presence")
         # Unconfirmed startup presence is not a connectivity/freshness failure.
         # Fresh responses can legitimately leave us waiting for lobby evidence.
-        self.degraded = (now - self.process_at > 1.0 or
-                         (bool(self.identity) and
-                          ((candidate is None and self.state != "LOADING") or
-                           not any(k in fresh for k in ("presence", "core", "pregame")))))
+        # Degraded triggers if process loop has hung (>5s) or game is running but we have
+        # zero API evidence across any stream within the freshness window.
+        has_any_fresh = any(k in fresh for k in ("presence", "core", "pregame", "party", "names"))
+        self.degraded = (now - self.process_at > 5.0 or
+                         (bool(self.identity) and self.state != "LOADING" and not has_any_fresh))
         self.state_confirmed = candidate is not None
         self.source = source if candidate else "last_known"
 
@@ -1801,6 +1809,7 @@ class Detector:
                 self.window_cache = get_window_info()
                 self.store.observe("window", self.window_cache, self.store.generation)
             except OSError:
+                self.store.touch_process()
                 self.store.error("process", "process_inspection_failed")
             self.stop_event.wait(.15)
 
