@@ -23,6 +23,8 @@ import http.server, json, os, subprocess, threading, time, re, ssl, base64, urll
 from ctypes import wintypes
 
 PORT = 8090
+QUEUE_MODES = {"unrated": "Unrated", "competitive": "Competitive", "swiftplay": "Swiftplay",
+               "spikerush": "Spike Rush", "deathmatch": "Deathmatch", "hurm": "Team Deathmatch"}
 GAME_LOG = os.path.expandvars(r"%LOCALAPPDATA%\VALORANT\Saved\Logs\ShooterGame.log")
 GAME_EXE = "VALORANT-Win64-Shipping.exe"
 GAME_EXE_PATHS = [
@@ -1572,10 +1574,14 @@ class Detector:
         self.window_cache = {"exists": False}
         self.refresh = threading.Event()
         self.remote_pause_until = 0.
+        self.dashboard_lock = threading.Lock()
+        self.dashboard_data = {}
+        self.dashboard_subject = None
         self.remote_wake = {kind: threading.Event() for kind in ("core", "pregame", "party")}
         self.lockfile = Path(os.environ.get("LOCALAPPDATA", "")) / "Riot Games/Riot Client/Config/lockfile"
 
     def start(self):
+        self._spawn(self._dashboard_loop)
         for target in (self._process_loop, self._local_loop, self._visual_loop, self._event_loop):
             self._spawn(target)
         for kind in ("core", "pregame", "party"):
@@ -1586,6 +1592,72 @@ class Detector:
         thread = threading.Thread(target=target, daemon=True)
         self.threads.append(thread)
         thread.start()
+
+    def dashboard_snapshot(self):
+        with self.auth_lock:
+            auth = self.auth
+        with self.dashboard_lock:
+            if not auth or auth[3] <= time.time() or auth[0] != self.dashboard_subject:
+                return {"available": False}
+            result = copy.deepcopy(self.dashboard_data)
+        age = time.time()-result.pop("fetched_at", 0)
+        result["available"] = bool(result) and age < 90
+        result["age_secs"] = max(0, round(age)) if result["available"] else None
+        return result if result["available"] else {"available": False}
+
+    def _dashboard_loop(self):
+        """Read-only account data; independent from latency-sensitive state workers."""
+        currency_ids = {"vp": "85ad13f7-3d1b-5128-9eb2-7cd8ee0b5741",
+                        "rp": "e59aa87c-4cbf-517a-5983-6e81511be9b7",
+                        "kc": "85ca954a-41f2-ce94-9b45-8ca3dd39a00d"}
+        due = 0
+        last_subject = None
+        with self._session() as session:
+            while not self.stop_event.wait(.5):
+                with self.auth_lock:
+                    auth = self.auth
+                    pause = self.remote_pause_until
+                if not auth or auth[3] <= time.time() or time.monotonic() < pause:
+                    continue
+                who, headers, _, _ = auth
+                if who != last_subject:
+                    due, last_subject = 0, who
+                    with self.dashboard_lock:
+                        self.dashboard_data = {}
+                        self.dashboard_subject = who
+                if time.monotonic() < due:
+                    continue
+                due = time.monotonic()+30
+                base = f"https://pd.{self.config.shard}.a.pvp.net"
+                result = {"fetched_at": time.time(), "balances": {}, "owned_agents": [], "ownership_available": False}
+                for kind, path in (("wallet", f"/store/v1/wallet/{who}"),
+                                   ("agents", f"/store/v1/entitlements/{who}/01bb38e1-da47-4e6a-9b3d-945fe4655707")):
+                    try:
+                        with session.get(base+path, headers=headers, timeout=(.5,1.5)) as response:
+                            if response.status_code == 401:
+                                self.refresh.set()
+                            if response.status_code == 429:
+                                with self.auth_lock:
+                                    self.remote_pause_until = max(self.remote_pause_until, time.monotonic()+self._retry_after(response.headers.get("Retry-After")))
+                                break
+                            response.raise_for_status()
+                            data = response.json()
+                        if kind == "wallet":
+                            balances = data.get("Balances", {})
+                            result["balances"] = {name: balances[uid] for name, uid in currency_ids.items()
+                                                  if type(balances.get(uid)) is int and balances[uid] >= 0}
+                        else:
+                            result["owned_agents"] = [row["ItemID"] for row in data.get("Entitlements", [])
+                                                      if isinstance(row, dict) and isinstance(row.get("ItemID"), str)][:100]
+                            result["ownership_available"] = isinstance(data.get("Entitlements"), list)
+                    except (_NetworkError, ValueError, KeyError, TypeError):
+                        pass
+                with self.auth_lock:
+                    current_auth = self.auth
+                if current_auth is auth:
+                    with self.dashboard_lock:
+                        self.dashboard_subject = who
+                        self.dashboard_data = result
 
     def close(self):
         self.stop_event.set()
@@ -1916,6 +1988,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if path in ("/status", "/state"):
                 status = detector.store.snapshot()
+                status["dashboard"] = detector.dashboard_snapshot()
+                status["queue_modes"] = [{"id": key, "name": name} for key, name in QUEUE_MODES.items()]
+                status["agent_catalog"] = [{"name": name, "id": uid} for name, uid in AGENTS.items()]
                 status["launch_status"] = get_launch_status()
                 status["window"] = dict(detector.window_cache)
                 status["map"] = "Unknown"

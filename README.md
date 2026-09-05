@@ -129,6 +129,28 @@ Run the offline tests with `py -m unittest discover -p "test_*.py" -v`.
 
 ## HTTP API Reference
 
+### Dashboard account data
+
+The single-file agent now adds `dashboard`, `agent_catalog`, and `queue_modes`
+to the cached `/status` response. A separate read-only worker requests wallet
+balances and agent entitlements every 30 seconds. It reuses the existing Riot
+authentication, observes shared rate-limit pauses, and never blocks the core-game
+or pregame workers. `/status` still makes no upstream requests.
+
+`dashboard.balances` can contain `vp`, `rp`, and `kc`. A missing balance is
+unavailable, not zero. Data expires after 90 seconds and is hidden when
+authentication expires or the account changes. `ownership_available` distinguishes
+an empty owned inventory from a failed inventory lookup. `owned_agents` contains
+agent item IDs, matched against `agent_catalog` by the controller.
+
+`queue_modes` describes the six queue modes currently supported by the agent;
+it does not assert that Riot currently enables each queue for the account.
+The catalogue is extensible so future supported modes need not alter dashboard
+layout code. No agent-purchase endpoint is added in this update.
+
+The controller's wallpaper and appearance settings are local to the Gaming PC.
+The Clean PC needs no media codecs, extra files, or new Python packages.
+
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/status` | Cached process/window state, phase, freshness, queue duration, transition alert, and live ally picks during Agent Select |
