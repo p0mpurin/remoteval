@@ -1600,7 +1600,11 @@ class Detector:
             if not auth or auth[3] <= time.time() or auth[0] != self.dashboard_subject:
                 return {"available": False}
             result = copy.deepcopy(self.dashboard_data)
-        age = time.time()-result.pop("fetched_at", 0)
+        updated_at = result.pop("fetched_at", 0)
+        age = time.time()-updated_at
+        if result:
+            result['account_id'] = auth[0]
+            result['updated_at'] = updated_at
         result["available"] = bool(result) and age < 90
         result["age_secs"] = max(0, round(age)) if result["available"] else None
         return result if result["available"] else {"available": False}

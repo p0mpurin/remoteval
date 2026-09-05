@@ -143,6 +143,12 @@ authentication expires or the account changes. `ownership_available` distinguish
 an empty owned inventory from a failed inventory lookup. `owned_agents` contains
 agent item IDs, matched against `agent_catalog` by the controller.
 
+Valid dashboard responses include `account_id` (the account PUUID) and
+`updated_at` (Unix seconds when the snapshot was fetched). The controller uses
+these fields to persist non-secret account data without mixing accounts. They
+are not authentication credentials. Cached displays must be labeled as saved
+data when the current client cannot refresh them.
+
 `queue_modes` describes the six queue modes currently supported by the agent;
 it does not assert that Riot currently enables each queue for the account.
 The catalogue is extensible so future supported modes need not alter dashboard
